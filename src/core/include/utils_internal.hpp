@@ -77,6 +77,15 @@ class TokenPool : public std::enable_shared_from_this<TokenPool> {
   std::vector<std::bitset<UINT64_WIDTH>> allocationMap_;
 };
 
+// helper type for visitor
+template<class... Ts>
+struct overloaded : Ts... { using Ts::operator()...; };
+template<class... Ts>
+overloaded(Ts...) -> overloaded<Ts...>;
+
+template <class... T>
+constexpr bool always_false = false;
+
 }  // namespace mscclpp
 
 #endif

@@ -1,0 +1,11 @@
+#ifndef MSCCLPP_OFI_WRAPPER_HPP_
+#define MSCCLPP_OFI_WRAPPER_HPP_
+
+#include <rdma/fabric.h>
+#include <rdma/fi_cm.h>
+#include <rdma/fi_domain.h>
+#include <rdma/fi_endpoint.h>
+#include <rdma/fi_errno.h>
+#include <rdma/fi_rma.h>
+
+#endif // MSCCLPP_OFI_WRAPPER_HPP_

@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <mscclpp/concurrency_device.hpp>

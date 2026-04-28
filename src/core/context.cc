@@ -12,6 +12,7 @@
 #include "endpoint.hpp"
 #include "registered_memory.hpp"
 
+#include <iostream>
 namespace mscclpp {
 
 CudaIpcStream::CudaIpcStream(int deviceId)
@@ -59,6 +60,49 @@ IbCtx* Context::Impl::getIbContext(Transport ibTransport) {
   return it->second.get();
 }
 
+void Context::Impl::bindOfiConfig(EndpointConfig::Ofi const& ofiConfig) {
+  std::lock_guard<std::mutex> lock(ofiMutex_);
+  if (!hasOfiConfig_) {
+    ofiConfig_ = ofiConfig;
+    hasOfiConfig_ = true;
+    return;
+  }
+  if (ofiConfig_.provider != ofiConfig.provider || ofiConfig_.domain != ofiConfig.domain) {
+    throw Error("All OFI endpoints in one Context must use the same provider/domain",
+                ErrorCode::InvalidUsage);
+  }
+}
+
+//std::unique_ptr<const OfiMr> Context::Impl::registerOfiMr(void* data, size_t size) {
+//  std::lock_guard<std::mutex> lock(ofiMutex_);
+//  if (!hasOfiConfig_) {
+//    throw Error("No OFI configuration is bound to this Context", ErrorCode::InvalidUsage);
+//  }
+//  if (!ofiCtx_) {
+//    ofiCtx_ = std::make_unique<OfiCtx>(ofiConfig_);
+//  }
+//  std::cout << "    Context::Impl::registerOfiMr for address " << data << " with size " << size << " using provider " << ofiConfig_.provider
+//            << " and domain " << ofiConfig_.domain << std::endl;
+//  return ofiCtx_->registerMr(data, size);
+//}
+
+std::unique_ptr<OfiEndpointResources> Context::Impl::createOfiEndpointResources(EndpointConfig const& config) {
+  std::lock_guard<std::mutex> lock(ofiMutex_);
+  if (!hasOfiConfig_) {
+    throw Error("No OFI configuration is bound to this Context", ErrorCode::InvalidUsage);
+  }
+  std::cout << "    Context::Impl::createOfiEndpointResources with provider " << ofiConfig_.provider
+            << " and domain " << ofiConfig_.domain << std::endl;
+  if (!ofiCtx_) {
+    std::cout << "    Creating OfiCtx for Context with provider " << ofiConfig_.provider << " and domain " << ofiConfig_.domain
+              << std::endl;
+    ofiCtx_ = std::make_unique<OfiCtx>(ofiConfig_);
+  }
+  std::cout << "    Returning OfiEndpointResources for Context with provider " << ofiConfig_.provider << " and domain " << ofiConfig_.domain
+            << std::endl;
+  return std::make_unique<OfiEndpointResources>(*ofiCtx_, config);
+}
+
 std::shared_ptr<uint64_t> Context::Impl::getToken() {
   if (!tokenPool_) {
     tokenPool_ = std::make_shared<TokenPool>(maxNumTokens_);
@@ -74,7 +118,13 @@ MSCCLPP_API_CPP RegisteredMemory Context::registerMemory(void* ptr, size_t size,
   return RegisteredMemory(std::make_shared<RegisteredMemory::Impl>(ptr, size, transports, *pimpl_));
 }
 
+MSCCLPP_API_CPP RegisteredMemory Context::registerMemory(void* ptr, size_t size, TransportFlags transports,
+                                                         const Connection& connection) {
+  return RegisteredMemory(std::make_shared<RegisteredMemory::Impl>(ptr, size, transports, *pimpl_, connection));
+}
+
 MSCCLPP_API_CPP Endpoint Context::createEndpoint(EndpointConfig config) {
+    std::cout << "Context::createEndpoint with transport " << config.transport << std::endl;
   return Endpoint(std::make_shared<Endpoint::Impl>(config, *pimpl_));
 }
 
@@ -101,6 +151,8 @@ MSCCLPP_API_CPP Connection Context::connect(const Endpoint& localEndpoint, const
     conn = std::make_shared<IBConnection>(shared_from_this(), localEndpoint, remoteEndpoint);
   } else if (localTransport == Transport::Ethernet) {
     conn = std::make_shared<EthernetConnection>(shared_from_this(), localEndpoint, remoteEndpoint);
+  } else if (localTransport == Transport::Ofi) {
+    conn = std::make_shared<OfiConnection>(shared_from_this(), localEndpoint, remoteEndpoint);
   } else {
     throw Error("Unsupported transport", ErrorCode::InternalError);
   }

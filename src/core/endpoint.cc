@@ -9,11 +9,14 @@
 #include "api.h"
 #include "context.hpp"
 #include "ib.hpp"
+#include "ofi.hpp"
 #include "logger.hpp"
 #include "registered_memory.hpp"
 #include "serialization.hpp"
 #include "socket.h"
 #include "utils_internal.hpp"
+
+#include <iostream>
 
 namespace mscclpp {
 
@@ -63,6 +66,31 @@ Endpoint::Impl::Impl(const EndpointConfig& config, Context::Impl& contextImpl)
     socket_ = std::make_unique<Socket>(&socketAddress_, MSCCLPP_SOCKET_MAGIC, SocketTypeBootstrap, abortFlag_);
     socket_->bindAndListen();
     socketAddress_ = socket_->getAddr();
+  } else if (config_.transport == Transport::Ofi) {
+      std::cout << "Creating OFI endpoint with provider " << config_.ofi.provider << " and domain " << config_.ofi.domain
+                << std::endl;
+#if defined(MSCCLPP_USE_OFI)
+      if (config_.ofi.provider.empty()) config_.ofi.provider = env()->ofiProvider;
+      if (config_.ofi.domain.empty()) config_.ofi.domain = env()->ofiDomain;
+      if (config_.ofi.domain.empty()) {
+        // domain =  cxiX, where X=config_.device.id
+        config_.ofi.domain = "cxi" + std::to_string(config_.device.id);
+      }
+      std::cout << "  Using OFI provider " << config_.ofi.provider << " and domain " << config_.ofi.domain << std::endl;
+      contextImpl.bindOfiConfig(config_.ofi);
+      if (config_.maxWriteQueueSize <= 0) {
+        config_.maxWriteQueueSize = 1024;
+      }
+      std::cout << "  Creating resources for OFI endpoint with transport " << config_.transport << std::endl;
+      ofiResources_ = contextImpl.createOfiEndpointResources(config_);
+      std::cout << "  OFI endpoint resources created" << std::endl;
+      ofiWireInfo_.flags = ofiResources_->flags();
+      ofiWireInfo_.addr = ofiResources_->address();
+      std::cout << "  OFI endpoint created with flags " << ofiWireInfo_.flags
+                << std::endl;
+#else
+      throw Error("OFI transport is not supported in this build", ErrorCode::InvalidUsage);
+#endif
   }
 }
 
@@ -76,6 +104,8 @@ Endpoint::Impl::Impl(const std::vector<char>& serialization) {
     it = detail::deserialize(it, ibQpInfo_);
   } else if (config_.transport == Transport::Ethernet) {
     it = detail::deserialize(it, socketAddress_);
+  } else if (config_.transport == Transport::Ofi) {
+    it = detail::deserialize(it, ofiWireInfo_);
   }
   if (it != serialization.end()) {
     throw Error("Endpoint deserialization failed", ErrorCode::Aborted);
@@ -105,6 +135,8 @@ MSCCLPP_API_CPP std::vector<char> Endpoint::serialize() const {
     detail::serialize(data, pimpl_->ibQpInfo_);
   } else if (pimpl_->config_.transport == Transport::Ethernet) {
     detail::serialize(data, pimpl_->socketAddress_);
+  } else if (pimpl_->config_.transport == Transport::Ofi) {
+    detail::serialize(data, pimpl_->ofiWireInfo_);
   }
   return data;
 }

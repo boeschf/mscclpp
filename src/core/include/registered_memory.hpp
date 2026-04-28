@@ -4,6 +4,9 @@
 #ifndef MSCCLPP_REGISTERED_MEMORY_HPP_
 #define MSCCLPP_REGISTERED_MEMORY_HPP_
 
+#include <optional>
+#include <variant>
+
 #include <mscclpp/core.hpp>
 #include <mscclpp/errors.hpp>
 #include <mscclpp/gpu.hpp>
@@ -11,21 +14,48 @@
 #include "communicator.hpp"
 #include "gpu_ipc_mem.hpp"
 #include "ib.hpp"
+#include "ofi.hpp"
 
 namespace mscclpp {
+
+namespace detail {
+
+template<TransportTagType T>
+struct TransportInfo {};
+
+template<>
+struct TransportInfo<TransportTagTrait<Transport::CudaIpc>::tag> {
+  GpuIpcMemHandle gpuIpcMemHandle;
+};
+
+template<>
+struct TransportInfo<IBTransportTag> {
+  bool ibLocal;
+  const IbMr* ibMr;
+  IbMrInfo ibMrInfo;
+};
+
+template<>
+struct TransportInfo<TransportTagTrait<Transport::Ofi>::tag> {
+  bool ofiLocal;
+  const OfiMr* ofiMr;
+  OfiMrInfo ofiMrInfo;
+};
+
+} // namespace detail
+
+template<Transport T>
+using TransportInfoType = typename detail::TransportInfo<detail::TransportTagTrait<T>::tag>;
 
 struct TransportInfo {
   Transport transport;
 
-  // TODO: rewrite this using std::variant or something
-  bool ibLocal;
-  union {
-    GpuIpcMemHandle gpuIpcMemHandle;
-    struct {
-      const IbMr* ibMr;
-      IbMrInfo ibMrInfo;
-    };
-  };
+  std::variant<
+    std::monostate,
+    TransportInfoType<Transport::CudaIpc>,
+    detail::TransportInfo<IBTransportTag>,
+    TransportInfoType<Transport::Ofi>
+  > data;
 };
 
 struct RegisteredMemory::Impl {
@@ -47,13 +77,31 @@ struct RegisteredMemory::Impl {
   // Only used for IB transport
   std::unordered_map<Transport, std::unique_ptr<const IbMr>> ibMrMap;
 
+  // Only used for OFI transport
+  std::unique_ptr<const OfiMr> ofiMr;
+
+  // Optional connection binding. Required for OFI local registrations and used
+  // by the communicator to derive the peer for sendMemory/recvMemory.
+  //BaseConnection const* boundConnection_ = nullptr;
+  std::optional<Connection> boundConnection_;
+
   Impl(void* data, size_t size, TransportFlags transports, Context::Impl& contextImpl);
+  Impl(void* data, size_t size, TransportFlags transports, Context::Impl& contextImpl, Connection const& boundConnection);
   Impl(const std::vector<char>::const_iterator& begin, const std::vector<char>::const_iterator& end);
   /// Constructs a RegisteredMemory::Impl from a vector of data. The constructor should only be used for the remote
   /// memory.
   Impl(const std::vector<char>& data);
 
+  void bindConnection(Connection const& connection) {
+    if (boundConnection_.has_value()) {
+      throw Error("RegisteredMemory is already bound to a connection", ErrorCode::InvalidUsage);
+    }
+    boundConnection_ = connection;
+  }
+
   const TransportInfo& getTransportInfo(Transport transport) const;
+
+  void registerNonOfiLocalTransports(void* data, size_t size, TransportFlags transports, Context::Impl& contextImpl);
 };
 
 }  // namespace mscclpp
