@@ -99,7 +99,8 @@ OfiMr::OfiMr(OfiEndpointResources& epRes, void* data, size_t size, OfiMemoryAttr
     fi_mr_attr attr = {};
     attr.mr_iov = &iov;
     attr.iov_count = 1;
-    attr.access = FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+    //attr.access = FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
+    attr.access = FI_READ | FI_WRITE | FI_RECV | FI_SEND | FI_REMOTE_READ | FI_REMOTE_WRITE;
     attr.offset = 0;
     attr.requested_key = 0;
     attr.context = nullptr;
@@ -281,13 +282,13 @@ OfiEndpointResources::OfiEndpointResources(OfiCtx& ctx, EndpointConfig const& co
 
   try {
     const size_t qsz =
-        (config.maxWriteQueueSize > 0) ? static_cast<size_t>(config.maxWriteQueueSize) : 1024;
+        (config.maxWriteQueueSize > 0) ? static_cast<size_t>(config.maxWriteQueueSize) : 4096;
 
     // Important: size endpoint queues, not just the CQ.
     epInfo->tx_attr->size = qsz;
     epInfo->rx_attr->size = qsz;
 
-    epInfo->tx_attr->op_flags |= (FI_INJECT_COMPLETE | FI_COMPLETION);
+    //epInfo->tx_attr->op_flags |= (FI_INJECT_COMPLETE | FI_COMPLETION);
 
     std::cout << "      OfiEndpointResources: creating AV for provider " << ctx.info()->fabric_attr->prov_name
               << " and domain " << ctx.info()->domain_attr->name << std::endl;
@@ -299,16 +300,22 @@ OfiEndpointResources::OfiEndpointResources(OfiCtx& ctx, EndpointConfig const& co
               << " and domain " << ctx.info()->domain_attr->name << std::endl;
 
     fi_cq_attr cqAttr = {};
-    //cqAttr.format = FI_CQ_FORMAT_CONTEXT;
-    cqAttr.format = FI_CQ_FORMAT_MSG;
+    cqAttr.format = FI_CQ_FORMAT_CONTEXT;
+    //cqAttr.format = FI_CQ_FORMAT_MSG;
     cqAttr.wait_obj = FI_WAIT_NONE;
-
     //cqAttr.size = (config.maxWriteQueueSize > 0) ? static_cast<size_t>(config.maxWriteQueueSize) : 1024;
     cqAttr.size = std::max<size_t>(qsz, epInfo->tx_attr->size + epInfo->rx_attr->size);
-
     rc = fi_cq_open(ctx.domain(), &cqAttr, &cq_, nullptr);
     checkOfi(rc, "fi_cq_open");
     std::cout << "      OfiEndpointResources: CQ created for provider " << ctx.info()->fabric_attr->prov_name
+              << " and domain " << ctx.info()->domain_attr->name << std::endl;
+
+    fi_cntr_attr cntrAttr = {};
+    cntrAttr.events = FI_CNTR_EVENTS_COMP;
+    cntrAttr.wait_obj = FI_WAIT_NONE;
+    rc = fi_cntr_open(ctx.domain(), &cntrAttr, &txCntr_, nullptr);
+    checkOfi(rc, "fi_cntr_open");
+    std::cout << "      OfiEndpointResources: CNTR created for provider " << ctx.info()->fabric_attr->prov_name
               << " and domain " << ctx.info()->domain_attr->name << std::endl;
 
     //rc = fi_endpoint(ctx.domain(), ctx.info(), &ep_, nullptr);
@@ -322,10 +329,17 @@ OfiEndpointResources::OfiEndpointResources(OfiCtx& ctx, EndpointConfig const& co
     std::cout << "      OfiEndpointResources: EP bound to AV for provider " << ctx.info()->fabric_attr->prov_name
               << " and domain " << ctx.info()->domain_attr->name << std::endl;
 
-    rc = fi_ep_bind(ep_, &cq_->fid, FI_TRANSMIT | FI_RECV);
+    //rc = fi_ep_bind(ep_, &cq_->fid, FI_TRANSMIT | FI_RECV);
+    //rc = fi_ep_bind(ep_, &cq_->fid, FI_TRANSMIT | FI_RECV | FI_SELECTIVE_COMPLETION);
+    rc = fi_ep_bind(ep_, &cq_->fid, FI_TRANSMIT | FI_SELECTIVE_COMPLETION);
     //rc = fi_ep_bind(ep_, &cq_->fid, FI_TRANSMIT);
     checkOfi(rc, "fi_ep_bind(CQ)");
     std::cout << "      OfiEndpointResources: EP bound to CQ for provider " << ctx.info()->fabric_attr->prov_name
+              << " and domain " << ctx.info()->domain_attr->name << std::endl;
+
+    rc = fi_ep_bind(ep_, &txCntr_->fid, FI_WRITE);
+    checkOfi(rc, "fi_ep_bind(CNTR)");
+    std::cout << "      OfiEndpointResources: EP bound to CNTR for provider " << ctx.info()->fabric_attr->prov_name
               << " and domain " << ctx.info()->domain_attr->name << std::endl;
 
     rc = fi_enable(ep_);
@@ -383,6 +397,10 @@ void OfiEndpointResources::closeAll() noexcept {
   if (ep_ != nullptr) {
     fi_close(&ep_->fid);
     ep_ = nullptr;
+  }
+  if (txCntr_ != nullptr) {
+    fi_close(&txCntr_->fid);
+    txCntr_ = nullptr;
   }
   if (cq_ != nullptr) {
     fi_close(&cq_->fid);

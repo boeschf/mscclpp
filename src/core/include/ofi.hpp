@@ -14,6 +14,7 @@ struct fid_ep;
 struct fid_av;
 struct fid_cq;
 struct fid_mr;
+struct fid_cntr;
 
 namespace mscclpp {
 
@@ -60,6 +61,7 @@ class OfiEndpointResources {
   fid_ep* ep() const { return ep_; }
   fid_av* av() const { return av_; }
   fid_cq* cq() const { return cq_; }
+  fid_cntr* txCntr() const { return txCntr_; }
 
   std::vector<uint8_t> const& address() const { return addr_; }
   uint32_t flags() const { return flags_; }
@@ -69,10 +71,11 @@ class OfiEndpointResources {
   void closeAll() noexcept;
   void cacheAddress();
 
-  OfiCtx* ctx_;
+  OfiCtx* ctx_ = nullptr;
   fid_ep* ep_ = nullptr;
   fid_av* av_ = nullptr;
   fid_cq* cq_ = nullptr;
+  fid_cntr* txCntr_ = nullptr;
 
   std::vector<uint8_t> addr_;
   uint32_t flags_ = 0;

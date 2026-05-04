@@ -667,6 +667,7 @@ struct OfiConnection::Impl {
   fi_addr_t peerAddr = FI_ADDR_UNSPEC;
 #endif  // defined(MSCCLPP_USE_OFI)
   uint64_t outstandingTx = 0;
+  uint64_t postedWrites = 0;
   bool useWriteDataSignal = false;
 
   std::unique_ptr<uint64_t> updateScratch;
@@ -794,13 +795,58 @@ void OfiConnection::write(RegisteredMemory dst, uint64_t dstOffset, RegisteredMe
                      /*context=*/nullptr);
   checkOfiConn(static_cast<int>(rc), "fi_write");
 
-  ++impl_->outstandingTx;
+  //++impl_->outstandingTx;
+  ++impl_->postedWrites;
 
   INFO(CONN, "OfiConnection write: local=", localBuf,
        " remote=", reinterpret_cast<void*>(remoteAddr),
        " size=", size,
        " rkey=", dstData.ofiMrInfo.rkey,
-       " outstandingTx=", impl_->outstandingTx);
+       " outstandingTx=", impl_->outstandingTx,
+       " postedWrites=", impl_->postedWrites
+       );
+
+  //iovec localIov = {};
+  //localIov.iov_base = localBuf;
+  //localIov.iov_len = static_cast<size_t>(size);
+
+  //fi_rma_iov remoteIov = {};
+  //remoteIov.addr = remoteAddr;
+  //remoteIov.len = static_cast<size_t>(size);
+  //remoteIov.key = dstData.ofiMrInfo.rkey;
+
+  //void* descs[1] = {srcData.ofiMr->desc()};
+
+  //fi_msg_rma msg = {};
+  //msg.msg_iov = &localIov;
+  //msg.desc = descs;
+  //msg.iov_count = 1;
+  //msg.addr = impl_->peerAddr;
+  //msg.rma_iov = &remoteIov;
+  //msg.rma_iov_count = 1;
+  //msg.context = nullptr;
+  //msg.data = 0;
+
+  //for (;;) {
+  //  int rc = fi_writemsg(impl_->resources->ep(), &msg, 0);
+  //  if (rc == 0) {
+  //    break;
+  //  }
+
+  //  if (rc == -FI_EAGAIN) {
+  //    if (!progressCompletionsOnce()) {
+  //      std::this_thread::yield();
+  //    }
+  //    continue;
+  //  }
+
+  //  checkOfiConn(rc, "fi_writemsg(write)");
+  //}
+
+  //INFO(CONN, "OfiConnection write: local=", localBuf,
+  //     " remote=", reinterpret_cast<void*>(remoteAddr),
+  //     " size=", size,
+  //     " rkey=", dstData.ofiMrInfo.rkey);
 #else
   (void)dst;
   (void)dstOffset;
@@ -835,62 +881,22 @@ void OfiConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint
   //uint64_t value = newValue;
   *impl_->updateScratch = newValue;
 
-  flush(-1);
-
   Impl::CompletionContext op{};
   std::cout << "Address of op context: " << static_cast<void*>(&op) << std::endl;
   INFO(mscclpp::CONN, "Address of op context: %p", static_cast<void*>(&op));
 
-  for (;;) {
-    int rc = fi_write(impl_->resources->ep(),
-                      impl_->updateScratch.get(),
-                      sizeof(uint64_t),
-                      impl_->updateScratchMr->desc(),
-                      impl_->peerAddr,
-                      dstData.ofiMrInfo.addr + dstOffset,
-                      dstData.ofiMrInfo.rkey,
-                      &op);
-
-    if (rc == 0) {
-      ++impl_->outstandingTx;
-      break;
-    }
-
-    if (rc == -FI_EAGAIN) {
-      if (!progressCompletionsOnce()) {
-        std::this_thread::yield();
-      }
-      continue;
-    }
-
-    checkOfiConn(rc, "fi_write(updateAndSync)");
-  }
-
-  //iovec localIov = {};
-  //localIov.iov_base = &value;
-  //localIov.iov_len = sizeof(value);
-
-  //fi_rma_iov remoteIov = {};
-  //remoteIov.addr = dstData.ofiMrInfo.addr + dstOffset;
-  //remoteIov.len = sizeof(value);
-  //remoteIov.key = dstData.ofiMrInfo.rkey;
-
-  //fi_msg_rma msg = {};
-  //msg.msg_iov = &localIov;
-  //msg.desc = nullptr;  // FI_INJECT => no local MR descriptor needed
-  //msg.iov_count = 1;
-  //msg.addr = impl_->peerAddr;
-  //msg.rma_iov = &remoteIov;
-  //msg.rma_iov_count = 1;
-  //msg.context = &op;
-  //msg.data = 0;
+  flush(-1);
 
   //for (;;) {
-  //  std::cout << "OfiConnection::updateAndSync: posting fi_writemsg with value=" << value
-  //            << ", remoteAddr=" << reinterpret_cast<void*>(remoteIov.addr)
-  //            << ", rkey=" << remoteIov.key
-  //            << std::endl;
-  //  auto rc = fi_writemsg(impl_->resources->ep(), &msg, FI_INJECT | FI_FENCE);
+  //  int rc = fi_write(impl_->resources->ep(),
+  //                    impl_->updateScratch.get(),
+  //                    sizeof(uint64_t),
+  //                    impl_->updateScratchMr->desc(),
+  //                    impl_->peerAddr,
+  //                    dstData.ofiMrInfo.addr + dstOffset,
+  //                    dstData.ofiMrInfo.rkey,
+  //                    &op);
+
   //  if (rc == 0) {
   //    ++impl_->outstandingTx;
   //    break;
@@ -903,14 +909,97 @@ void OfiConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint
   //    continue;
   //  }
 
-  //  checkOfiConn(static_cast<int>(rc), "fi_writemsg(updateAndSync)");
+  //  checkOfiConn(rc, "fi_write(updateAndSync)");
   //}
 
+  ////iovec localIov = {};
+  ////localIov.iov_base = &value;
+  ////localIov.iov_len = sizeof(value);
+
+  ////fi_rma_iov remoteIov = {};
+  ////remoteIov.addr = dstData.ofiMrInfo.addr + dstOffset;
+  ////remoteIov.len = sizeof(value);
+  ////remoteIov.key = dstData.ofiMrInfo.rkey;
+
+  ////fi_msg_rma msg = {};
+  ////msg.msg_iov = &localIov;
+  ////msg.desc = nullptr;  // FI_INJECT => no local MR descriptor needed
+  ////msg.iov_count = 1;
+  ////msg.addr = impl_->peerAddr;
+  ////msg.rma_iov = &remoteIov;
+  ////msg.rma_iov_count = 1;
+  ////msg.context = &op;
+  ////msg.data = 0;
+
+  ////for (;;) {
+  ////  std::cout << "OfiConnection::updateAndSync: posting fi_writemsg with value=" << value
+  ////            << ", remoteAddr=" << reinterpret_cast<void*>(remoteIov.addr)
+  ////            << ", rkey=" << remoteIov.key
+  ////            << std::endl;
+  ////  auto rc = fi_writemsg(impl_->resources->ep(), &msg, FI_INJECT | FI_FENCE);
+  ////  if (rc == 0) {
+  ////    ++impl_->outstandingTx;
+  ////    break;
+  ////  }
+
+  ////  if (rc == -FI_EAGAIN) {
+  ////    if (!progressCompletionsOnce()) {
+  ////      std::this_thread::yield();
+  ////    }
+  ////    continue;
+  ////  }
+
+  ////  checkOfiConn(static_cast<int>(rc), "fi_writemsg(updateAndSync)");
+  ////}
+
+  //INFO(CONN, "OfiConnection updateAndSync: value ", oldValue, " -> ", newValue,
+  //     //" remote=", reinterpret_cast<void*>(remoteIov.addr),
+  //     //" rkey=", remoteIov.key,
+  //     " remote=", reinterpret_cast<void*>(dstData.ofiMrInfo.addr + dstOffset),
+  //     " rkey=", dstData.ofiMrInfo.rkey,
+  //     " outstandingTx=", impl_->outstandingTx);
+
+  iovec localIov = {};
+  localIov.iov_base = impl_->updateScratch.get();
+  localIov.iov_len = sizeof(uint64_t);
+
+  fi_rma_iov remoteIov = {};
+  remoteIov.addr = dstData.ofiMrInfo.addr + dstOffset;
+  remoteIov.len = sizeof(uint64_t);
+  remoteIov.key = dstData.ofiMrInfo.rkey;
+
+  void* descs[1] = {impl_->updateScratchMr->desc()};
+
+  fi_msg_rma msg = {};
+  msg.msg_iov = &localIov;
+  msg.desc = descs;
+  msg.iov_count = 1;
+  msg.addr = impl_->peerAddr;
+  msg.rma_iov = &remoteIov;
+  msg.rma_iov_count = 1;
+  msg.context = &op;
+  msg.data = 0;
+
+  for (;;) {
+    int rc = fi_writemsg(impl_->resources->ep(), &msg, FI_COMPLETION);
+    if (rc == 0) {
+      ++impl_->outstandingTx;
+      break;
+    }
+
+    if (rc == -FI_EAGAIN) {
+      if (!progressCompletionsOnce()) {
+        std::this_thread::yield();
+      }
+      continue;
+    }
+
+    checkOfiConn(rc, "fi_writemsg(updateAndSync)");
+  }
+
   INFO(CONN, "OfiConnection updateAndSync: value ", oldValue, " -> ", newValue,
-       //" remote=", reinterpret_cast<void*>(remoteIov.addr),
-       //" rkey=", remoteIov.key,
-       " remote=", reinterpret_cast<void*>(dstData.ofiMrInfo.addr + dstOffset),
-       " rkey=", dstData.ofiMrInfo.rkey,
+       " remote=", reinterpret_cast<void*>(remoteIov.addr),
+       " rkey=", remoteIov.key,
        " outstandingTx=", impl_->outstandingTx);
 
   std::cout << "OfiConnection::updateAndSync: waiting for completion of update..." << std::endl;
@@ -926,19 +1015,49 @@ void OfiConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint
 #endif
 }
 
+
+//void OfiConnection::flush(int64_t timeoutUsec) {
+//#if defined(MSCCLPP_USE_OFI)
+//  if (!impl_ || !impl_->resources) {
+//    THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
+//  }
+//  std::cout << "OfiConnection::flush: outstandingTx=" << impl_->outstandingTx << std::endl;
+//
+//  if (impl_->outstandingTx == 0) {
+//    return;
+//  }
+//
+//  waitForCompletions(timeoutUsec, nullptr, /*drainAll=*/true);
+//  INFO(CONN, "OfiConnection flush completed");
+//#else
+//  (void)timeoutUsec;
+//  THROW(CONN, Error, ErrorCode::InvalidUsage,
+//        "OFI transport requested but MSCCLPP was built without OFI support");
+//#endif
+//}
 void OfiConnection::flush(int64_t timeoutUsec) {
 #if defined(MSCCLPP_USE_OFI)
   if (!impl_ || !impl_->resources) {
     THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
   }
-  std::cout << "OfiConnection::flush: outstandingTx=" << impl_->outstandingTx << std::endl;
 
-  if (impl_->outstandingTx == 0) {
+  const uint64_t target = impl_->postedWrites;
+  if (target == 0) {
     return;
   }
 
-  waitForCompletions(timeoutUsec, nullptr, /*drainAll=*/true);
-  INFO(CONN, "OfiConnection flush completed");
+  const auto deadline =
+      (timeoutUsec < 0)
+          ? std::chrono::steady_clock::time_point::max()
+          : std::chrono::steady_clock::now() + std::chrono::microseconds(timeoutUsec);
+
+  while (fi_cntr_read(impl_->resources->txCntr()) < target) {
+    if (timeoutUsec >= 0 && std::chrono::steady_clock::now() >= deadline) {
+      THROW(CONN, Error, ErrorCode::Aborted,
+            "OfiConnection::flush timed out waiting for write counter");
+    }
+    std::this_thread::yield();
+  }
 #else
   (void)timeoutUsec;
   THROW(CONN, Error, ErrorCode::InvalidUsage,
