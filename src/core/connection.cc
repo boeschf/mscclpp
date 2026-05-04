@@ -654,6 +654,9 @@ struct OfiConsumeGuard {
 
 struct OfiConnection::Impl {
   struct CompletionContext {
+#if defined(MSCCLPP_USE_OFI)
+    fi_context _reserved = {};  // reserved for OFI completion context (must be first member)
+#endif  // defined(MSCCLPP_USE_OFI)
     bool done = false;
   };
 
@@ -835,6 +838,8 @@ void OfiConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint
   flush(-1);
 
   Impl::CompletionContext op{};
+  std::cout << "Address of op context: " << static_cast<void*>(&op) << std::endl;
+  INFO(mscclpp::CONN, "Address of op context: %p", static_cast<void*>(&op));
 
   for (;;) {
     int rc = fi_write(impl_->resources->ep(),
@@ -950,6 +955,8 @@ bool OfiConnection::progressCompletionsOnce() {
   fi_cq_entry entries[8];
   auto rc = fi_cq_read(impl_->resources->cq(), entries, 8);
 
+  std::cout << "OfiConnection::progressCompletionsOnce: fi_cq_read returned " << rc << std::endl;
+
   if (rc > 0) {
     for (ssize_t i = 0; i < rc; ++i) {
       if (impl_->outstandingTx == 0) {
@@ -983,9 +990,13 @@ bool OfiConnection::progressCompletionsOnce() {
         fi_cq_strerror(impl_->resources->cq(), err.prov_errno, err.err_data, errBuf, sizeof(errBuf));
 
     THROW(CONN, Error, ErrorCode::SystemError,
-          "OFI CQ error: err=", err.err,
-          " prov_errno=", err.prov_errno,
-          " msg=", (errStr ? errStr : "unknown"));
+      "OFI CQ error: err=", err.err,
+      " prov_errno=", err.prov_errno,
+      " flags=", err.flags,
+      " op_context=", err.op_context,
+      " len=", err.len,
+      " olen=", err.olen,
+      " msg=", (errStr ? errStr : "unknown"));
   }
 
   checkOfiConn(static_cast<int>(rc), "fi_cq_read");

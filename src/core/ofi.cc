@@ -136,7 +136,8 @@ OfiMr::OfiMr(OfiEndpointResources& epRes, void* data, size_t size, OfiMemoryAttr
     rc = fi_mr_reg(ctx.domain(),
                    data,
                    size,
-                   FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE,
+                   //FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE,
+                   FI_READ | FI_WRITE | FI_RECV | FI_SEND | FI_REMOTE_READ | FI_REMOTE_WRITE,
                    0,
                    0,
                    0,
@@ -191,9 +192,11 @@ OfiCtx::OfiCtx(EndpointConfig::Ofi const& config) {
 
   try {
     hints->domain_attr->mr_mode = FI_MR_ENDPOINT | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
-    hints->caps = FI_MSG | FI_RMA | FI_HMEM | FI_LOCAL_COMM | FI_REMOTE_COMM;
+    //hints->caps = FI_MSG | FI_RMA | FI_HMEM | FI_LOCAL_COMM | FI_REMOTE_COMM;
+    hints->caps = FI_RMA | FI_HMEM | FI_LOCAL_COMM | FI_REMOTE_COMM;
     hints->ep_attr->type = FI_EP_RDM;
-    hints->domain_attr->threading = FI_THREAD_DOMAIN;
+    //hints->domain_attr->threading = FI_THREAD_DOMAIN;
+    hints->domain_attr->threading = FI_THREAD_SAFE;
     hints->domain_attr->control_progress = FI_PROGRESS_MANUAL;
     hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
 
@@ -281,8 +284,10 @@ OfiEndpointResources::OfiEndpointResources(OfiCtx& ctx, EndpointConfig const& co
         (config.maxWriteQueueSize > 0) ? static_cast<size_t>(config.maxWriteQueueSize) : 1024;
 
     // Important: size endpoint queues, not just the CQ.
-    epInfo->tx_attr->size = 8192;
-    epInfo->rx_attr->size = 8192;
+    epInfo->tx_attr->size = qsz;
+    epInfo->rx_attr->size = qsz;
+
+    epInfo->tx_attr->op_flags |= (FI_INJECT_COMPLETE | FI_COMPLETION);
 
     std::cout << "      OfiEndpointResources: creating AV for provider " << ctx.info()->fabric_attr->prov_name
               << " and domain " << ctx.info()->domain_attr->name << std::endl;
@@ -294,15 +299,20 @@ OfiEndpointResources::OfiEndpointResources(OfiCtx& ctx, EndpointConfig const& co
               << " and domain " << ctx.info()->domain_attr->name << std::endl;
 
     fi_cq_attr cqAttr = {};
-    cqAttr.format = FI_CQ_FORMAT_CONTEXT;
+    //cqAttr.format = FI_CQ_FORMAT_CONTEXT;
+    cqAttr.format = FI_CQ_FORMAT_MSG;
     cqAttr.wait_obj = FI_WAIT_NONE;
-    cqAttr.size = (config.maxWriteQueueSize > 0) ? static_cast<size_t>(config.maxWriteQueueSize) : 1024;
+
+    //cqAttr.size = (config.maxWriteQueueSize > 0) ? static_cast<size_t>(config.maxWriteQueueSize) : 1024;
+    cqAttr.size = std::max<size_t>(qsz, epInfo->tx_attr->size + epInfo->rx_attr->size);
+
     rc = fi_cq_open(ctx.domain(), &cqAttr, &cq_, nullptr);
     checkOfi(rc, "fi_cq_open");
     std::cout << "      OfiEndpointResources: CQ created for provider " << ctx.info()->fabric_attr->prov_name
               << " and domain " << ctx.info()->domain_attr->name << std::endl;
 
-    rc = fi_endpoint(ctx.domain(), ctx.info(), &ep_, nullptr);
+    //rc = fi_endpoint(ctx.domain(), ctx.info(), &ep_, nullptr);
+    rc = fi_endpoint(ctx.domain(), epInfo, &ep_, nullptr);
     checkOfi(rc, "fi_endpoint");
     std::cout << "      OfiEndpointResources: EP created for provider " << ctx.info()->fabric_attr->prov_name
               << " and domain " << ctx.info()->domain_attr->name << std::endl;
@@ -313,6 +323,7 @@ OfiEndpointResources::OfiEndpointResources(OfiCtx& ctx, EndpointConfig const& co
               << " and domain " << ctx.info()->domain_attr->name << std::endl;
 
     rc = fi_ep_bind(ep_, &cq_->fid, FI_TRANSMIT | FI_RECV);
+    //rc = fi_ep_bind(ep_, &cq_->fid, FI_TRANSMIT);
     checkOfi(rc, "fi_ep_bind(CQ)");
     std::cout << "      OfiEndpointResources: EP bound to CQ for provider " << ctx.info()->fabric_attr->prov_name
               << " and domain " << ctx.info()->domain_attr->name << std::endl;
@@ -330,17 +341,17 @@ OfiEndpointResources::OfiEndpointResources(OfiCtx& ctx, EndpointConfig const& co
     if (supportsWriteData_) {
       flags_ |= kOfiEndpointFlagWriteData;
     }
-    {
-      size_t injectRmaSize = 0;
-      size_t optlen = sizeof(injectRmaSize);
-      int rc = fi_getopt(&ep_->fid, FI_OPT_ENDPOINT, FI_OPT_INJECT_RMA_SIZE, &injectRmaSize, &optlen);
-      if (rc == -FI_ENOPROTOOPT) {
-        injectRmaSize = ctx.info()->tx_attr->inject_size;
-      }
-      std::cout << "OFI inject sizes: tx_attr->inject_size=" << ctx.info()->tx_attr->inject_size << " inject_rma_size=" << injectRmaSize << std::endl;
-      INFO(CONN, "OFI inject sizes: tx_attr->inject_size=", ctx.info()->tx_attr->inject_size,
-           " inject_rma_size=", injectRmaSize);
-    }
+    //{
+    //  size_t injectRmaSize = 0;
+    //  size_t optlen = sizeof(injectRmaSize);
+    //  int rc = fi_getopt(&ep_->fid, FI_OPT_ENDPOINT, FI_OPT_INJECT_RMA_SIZE, &injectRmaSize, &optlen);
+    //  if (rc == -FI_ENOPROTOOPT) {
+    //    injectRmaSize = ctx.info()->tx_attr->inject_size;
+    //  }
+    //  std::cout << "OFI inject sizes: tx_attr->inject_size=" << ctx.info()->tx_attr->inject_size << " inject_rma_size=" << injectRmaSize << std::endl;
+    //  INFO(CONN, "OFI inject sizes: tx_attr->inject_size=", ctx.info()->tx_attr->inject_size,
+    //       " inject_rma_size=", injectRmaSize);
+    //}
 
     fi_freeinfo(epInfo);
     epInfo = nullptr;
