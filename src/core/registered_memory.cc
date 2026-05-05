@@ -13,6 +13,7 @@
 
 #include "api.h"
 #include "context.hpp"
+#include "connection.hpp"
 #include "logger.hpp"
 #include "serialization.hpp"
 #include "unix_socket.hpp"
@@ -32,33 +33,34 @@
 
 namespace mscclpp {
 
-RegisteredMemory::Impl::Impl(void* data, size_t size, TransportFlags transports, Context::Impl& contextImpl)
-    : data(data),
-      originalDataPtr(data),
-      size(size),
-      hostHash(getHostHash()),
-      pidHash(getPidHash()),
-      transports(transports) {
+void RegisteredMemory::Impl::registerNonOfiLocalTransports(void* data, size_t size,TransportFlags transports, Context::Impl& contextImpl) {
   if (transports.has(Transport::CudaIpc)) {
     CudaDeviceGuard deviceGuard(detail::gpuIdFromAddress(data));
 
     localGpuIpcMemHandle = GpuIpcMemHandle::create(reinterpret_cast<CUdeviceptr>(data));
     TransportInfo transportInfo;
     transportInfo.transport = Transport::CudaIpc;
-    transportInfo.gpuIpcMemHandle = *localGpuIpcMemHandle;
-    this->transportInfos.emplace_back(transportInfo);
+    using DataType = TransportInfoType<Transport::CudaIpc>;
+    transportInfo.data.emplace<DataType>(DataType{*localGpuIpcMemHandle});
+    transportInfos.emplace_back(transportInfo);
   }
+
   if ((transports & AllIBTransports).any()) {
     auto addIb = [&](Transport ibTransport) {
       TransportInfo transportInfo;
       transportInfo.transport = ibTransport;
-      this->ibMrMap[ibTransport] = contextImpl.getIbContext(ibTransport)->registerMr(data, size);
-      transportInfo.ibMr = this->ibMrMap[ibTransport].get();
-      transportInfo.ibLocal = true;
-      transportInfo.ibMrInfo = this->ibMrMap[ibTransport]->getInfo();
-      this->transportInfos.push_back(transportInfo);
+      ibMrMap[ibTransport] = contextImpl.getIbContext(ibTransport)->registerMr(data, size);
+
+      using DataType = detail::TransportInfo<IBTransportTag>;
+      transportInfo.data.emplace<DataType>(
+          DataType{
+              /*ibLocal=*/true,
+              /*ibMr=*/ibMrMap[ibTransport].get(),
+              /*ibMrInfo=*/ibMrMap[ibTransport]->getInfo()});
+      transportInfos.push_back(transportInfo);
       INFO(NET, "IB mr for address ", data, " with size ", size, " is registered");
     };
+
     if (transports.has(Transport::IB0)) addIb(Transport::IB0);
     if (transports.has(Transport::IB1)) addIb(Transport::IB1);
     if (transports.has(Transport::IB2)) addIb(Transport::IB2);
@@ -67,6 +69,81 @@ RegisteredMemory::Impl::Impl(void* data, size_t size, TransportFlags transports,
     if (transports.has(Transport::IB5)) addIb(Transport::IB5);
     if (transports.has(Transport::IB6)) addIb(Transport::IB6);
     if (transports.has(Transport::IB7)) addIb(Transport::IB7);
+  }
+}
+
+RegisteredMemory::Impl::Impl(void* data, size_t size, TransportFlags transports, Context::Impl& contextImpl)
+    : data(data),
+      originalDataPtr(data),
+      size(size),
+      hostHash(getHostHash()),
+      pidHash(getPidHash()),
+      transports(transports) {
+  DEBUG(NET, "RegisteredMemory::Impl ctor data=", data, " size=", size,
+        " transport_count=", transports.count());
+
+  registerNonOfiLocalTransports(data, size, transports, contextImpl);
+
+  if (transports.has(Transport::Ofi)) {
+    throw Error("Transport::Ofi requires connection-aware registerMemory(ptr, size, transports, connection)", ErrorCode::InvalidUsage);
+//#if defined(MSCCLPP_USE_OFI)
+//    TransportInfo transportInfo;
+//    transportInfo.transport = Transport::Ofi;
+//    std::cout << "Registering OFI mr for address " << data << " with size " << size << std::endl;
+//    this->ofiMr = contextImpl.registerOfiMr(data, size);
+//    std::cout << "Registered OFI mr with addr " << this->ofiMr->getInfo().addr << " and rkey " << this->ofiMr->getInfo().rkey << std::endl;
+//
+//    using DataType = TransportInfoType<Transport::Ofi>;
+//    transportInfo.data.emplace<DataType>(
+//        DataType{
+//            /*.ofiLocal = */ true,
+//            /*.ofiMr = */ this->ofiMr.get(),
+//            /*.ofiMrInfo = */ this->ofiMr->getInfo()});
+//    this->transportInfos.push_back(transportInfo);
+//    INFO(NET, "OFI mr for address ", data, " with size ", size, " is registered");
+//#else
+//    throw Error("OFI transport requested but MSCCLPP was built without OFI support",
+//                ErrorCode::InvalidUsage);
+//#endif
+  }
+}
+
+RegisteredMemory::Impl::Impl(void* data, size_t size, TransportFlags transports, Context::Impl& contextImpl,
+                             const Connection& connection)
+    : data(data),
+      originalDataPtr(data),
+      size(size),
+      hostHash(getHostHash()),
+      pidHash(getPidHash()),
+      transports(transports),
+      boundConnection_(connection) {
+  registerNonOfiLocalTransports(data, size, transports, contextImpl);
+
+  if (transports.has(Transport::Ofi)) {
+#if defined(MSCCLPP_USE_OFI)
+    if (boundConnection_->transport() != Transport::Ofi) {
+      throw Error("Connection-bound OFI memory registration requires an OFI connection",
+                  ErrorCode::InvalidUsage);
+    }
+
+    TransportInfo transportInfo;
+    transportInfo.transport = Transport::Ofi;
+    auto& baseConnImpl = *BaseConnection::getImpl(*boundConnection_);
+    this->ofiMr = baseConnImpl.registerOfiMr(data, size);
+
+    using DataType = TransportInfoType<Transport::Ofi>;
+    transportInfo.data.emplace<DataType>(
+        DataType{
+            /*ofiLocal=*/true,
+            /*ofiMr=*/this->ofiMr.get(),
+            /*ofiMrInfo=*/this->ofiMr->getInfo()});
+    this->transportInfos.push_back(transportInfo);
+
+    INFO(NET, "OFI mr for address ", data, " with size ", size, " is registered");
+#else
+    throw Error("OFI transport requested but MSCCLPP was built without OFI support",
+                ErrorCode::InvalidUsage);
+#endif
   }
 }
 
@@ -96,13 +173,24 @@ MSCCLPP_API_CPP std::vector<char> RegisteredMemory::serialize() const {
   detail::serialize(result, transportCount);
   for (auto& entry : pimpl_->transportInfos) {
     detail::serialize(result, entry.transport);
-    if (entry.transport == Transport::CudaIpc) {
-      detail::serialize(result, entry.gpuIpcMemHandle);
-    } else if (AllIBTransports.has(entry.transport)) {
-      detail::serialize(result, entry.ibMrInfo);
-    } else {
-      throw Error("Unknown transport", ErrorCode::InternalError);
-    }
+    std::visit(overloaded{
+      [](std::monostate const&) {
+        throw Error("Unknown transport", ErrorCode::InternalError);
+      },
+      [&result](TransportInfoType<Transport::CudaIpc> const& data) {
+        detail::serialize(result, data.gpuIpcMemHandle);
+      },
+      [&result](detail::TransportInfo<IBTransportTag> const& data) {
+        detail::serialize(result, data.ibMrInfo);
+      },
+      [&result](TransportInfoType<Transport::Ofi> const& data) {
+        detail::serialize(result, data.ofiMrInfo);
+      },
+      [](auto const& data) {
+        static_assert(always_false<std::decay_t<decltype(data)>>, "Missing serialization for this transport type");
+      }},
+      entry.data
+    );
   }
   return result;
 }
@@ -125,10 +213,17 @@ RegisteredMemory::Impl::Impl(const std::vector<char>::const_iterator& begin,
     TransportInfo transportInfo;
     it = detail::deserialize(it, transportInfo.transport);
     if (transportInfo.transport == Transport::CudaIpc) {
-      it = detail::deserialize(it, transportInfo.gpuIpcMemHandle);
+      it = detail::deserialize(it, transportInfo.data.emplace<TransportInfoType<Transport::CudaIpc>>().gpuIpcMemHandle);
     } else if (AllIBTransports.has(transportInfo.transport)) {
-      it = detail::deserialize(it, transportInfo.ibMrInfo);
-      transportInfo.ibLocal = false;
+      auto& data = transportInfo.data.emplace<detail::TransportInfo<IBTransportTag>>();
+      it = detail::deserialize(it, data.ibMrInfo);
+      data.ibLocal = false;
+      data.ibMr = nullptr;
+    } else if (transportInfo.transport == Transport::Ofi) {
+      auto& data = transportInfo.data.emplace<TransportInfoType<Transport::Ofi>>();
+      it = detail::deserialize(it, data.ofiMrInfo);
+      data.ofiLocal = false;
+      data.ofiMr = nullptr;
     } else {
       throw Error("Unknown transport", ErrorCode::InternalError);
     }
@@ -145,7 +240,8 @@ RegisteredMemory::Impl::Impl(const std::vector<char>::const_iterator& begin,
     this->data = this->originalDataPtr;
     if (transports.has(Transport::CudaIpc)) {
       auto entry = getTransportInfo(Transport::CudaIpc);
-      if ((entry.gpuIpcMemHandle.typeFlags & GpuIpcMemHandle::Type::RuntimeIpc) == 0) {
+      auto& data = std::get<TransportInfoType<Transport::CudaIpc>>(entry.data);
+      if ((data.gpuIpcMemHandle.typeFlags & GpuIpcMemHandle::Type::RuntimeIpc) == 0) {
         // Query which device owns this memory
         int gpuId = detail::gpuIdFromAddress(this->data);
         int currentDevice = -1;
@@ -153,13 +249,14 @@ RegisteredMemory::Impl::Impl(const std::vector<char>::const_iterator& begin,
 
         // Only set access if we're on a different device than where memory was allocated
         if (gpuId != currentDevice) {
-          detail::setReadWriteMemoryAccess(this->data, entry.gpuIpcMemHandle.baseSize);
+          detail::setReadWriteMemoryAccess(this->data, data.gpuIpcMemHandle.baseSize);
         }
       }
     }
   } else if (transports.has(Transport::CudaIpc)) {
     auto entry = getTransportInfo(Transport::CudaIpc);
-    auto gpuIpcMem = GpuIpcMem::create(entry.gpuIpcMemHandle);
+    auto& data = std::get<TransportInfoType<Transport::CudaIpc>>(entry.data);
+    auto gpuIpcMem = GpuIpcMem::create(data.gpuIpcMemHandle);
     // Create a memory map for the remote GPU memory. The memory map will keep the GpuIpcMem instance alive.
     this->remoteMemMap = gpuIpcMem->map();
     this->data = this->remoteMemMap.get();
@@ -179,6 +276,24 @@ const TransportInfo& RegisteredMemory::Impl::getTransportInfo(Transport transpor
     }
   }
   throw Error("Transport data not found", ErrorCode::InternalError);
+}
+
+MSCCLPP_API_CPP bool RegisteredMemory::hasConnection() const {
+  return pimpl_ && pimpl_->boundConnection_.has_value();
+}
+
+MSCCLPP_API_CPP Connection RegisteredMemory::connection() const {
+  if (!pimpl_ || !pimpl_->boundConnection_.has_value()) {
+    throw Error("RegisteredMemory is not bound to a connection", ErrorCode::InvalidUsage);
+  }
+  return *pimpl_->boundConnection_;
+}
+
+MSCCLPP_API_CPP void RegisteredMemory::bindConnection(const Connection& connection) {
+  if (!pimpl_) {
+    throw Error("RegisteredMemory is not initialized", ErrorCode::InternalError);
+  }
+  pimpl_->bindConnection(connection);
 }
 
 }  // namespace mscclpp

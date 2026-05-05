@@ -23,6 +23,7 @@ class Proxy;
 
 /// Handler function type for proxy.
 using ProxyHandler = std::function<ProxyHandlerResult(ProxyTrigger)>;
+using ProxyProgress = std::function<void()>;
 
 /// Host-side proxy for PortChannels.
 class Proxy {
@@ -33,12 +34,15 @@ class Proxy {
   ///        The function should initialize thread runtime context before any CUDA API call in that thread
   ///        (for example, set CUDA device and optionally bind NUMA affinity).
   /// @param fifoSize FIFO size (default: DEFAULT_FIFO_SIZE).
-  Proxy(ProxyHandler handler, std::function<void()> threadInit, int fifoSize = DEFAULT_FIFO_SIZE);
+  /// @param progress Optional callback invoked periodically in the proxy thread.
+  Proxy(ProxyHandler handler, std::function<void()> threadInit, int fifoSize = DEFAULT_FIFO_SIZE,
+        ProxyProgress progress = {});
 
   /// Constructor.
   /// @param handler Handler for each FIFO trigger.
   /// @param fifoSize FIFO size (default: DEFAULT_FIFO_SIZE).
-  Proxy(ProxyHandler handler, int fifoSize = DEFAULT_FIFO_SIZE);
+  /// @param progress Optional callback invoked periodically in the proxy thread.
+  Proxy(ProxyHandler handler, int fifoSize = DEFAULT_FIFO_SIZE, ProxyProgress progress = {});
 
   /// Destructor. Stops proxy if running.
   ~Proxy();

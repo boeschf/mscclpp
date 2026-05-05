@@ -6,10 +6,12 @@
 
 #include <mscclpp/core.hpp>
 #include <mscclpp/gpu_utils.hpp>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
 #include "ib.hpp"
+#include "ofi.hpp"
 
 namespace mscclpp {
 
@@ -38,6 +40,13 @@ class CudaIpcStream {
 class TokenPool;
 struct Context::Impl {
   std::unordered_map<Transport, std::unique_ptr<IbCtx>> ibContexts_;
+
+  // Shared OFI domain state for this Context
+  mutable std::mutex ofiMutex_;
+  std::unique_ptr<OfiCtx> ofiCtx_;
+  EndpointConfig::Ofi ofiConfig_;
+  bool hasOfiConfig_ = false;
+
   std::vector<std::shared_ptr<CudaIpcStream>> ipcStreams_;
   std::shared_ptr<TokenPool> tokenPool_;
   const size_t maxNumTokens_ = 1 << 15;  // 32K tokens
@@ -45,6 +54,11 @@ struct Context::Impl {
   Impl();
 
   IbCtx* getIbContext(Transport ibTransport);
+
+  void bindOfiConfig(EndpointConfig::Ofi const& ofiConfig);
+  //std::unique_ptr<const OfiMr> registerOfiMr(void* data, size_t size);
+  std::unique_ptr<OfiEndpointResources> createOfiEndpointResources(EndpointConfig const& config);
+
   std::shared_ptr<uint64_t> getToken();
 };
 

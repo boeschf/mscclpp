@@ -5,6 +5,7 @@
 #include <mscclpp/port_channel.hpp>
 
 #include "api.h"
+#include "connection.hpp"
 #include "debug.h"
 
 namespace mscclpp {
@@ -38,23 +39,45 @@ MSCCLPP_API_CPP ProxyService::ProxyService(int fifoSize) {
     }
   };
   auto handlerFunc = [&](ProxyTrigger triggerRaw) { return handleTrigger(triggerRaw); };
-  proxy_ = std::make_shared<Proxy>(handlerFunc, initFunc, fifoSize);
+  auto progressFunc = [&]() { progressConnections(); };
+  proxy_ = std::make_shared<Proxy>(handlerFunc, initFunc, fifoSize, progressFunc);
 }
 
 MSCCLPP_API_CPP SemaphoreId ProxyService::buildAndAddSemaphore(Communicator& communicator,
                                                                const Connection& connection) {
   semaphores_.push_back(std::make_shared<Host2DeviceSemaphore>(communicator, connection));
+  maybeTrackConnection(connection);
   return semaphores_.size() - 1;
 }
 
 MSCCLPP_API_CPP SemaphoreId ProxyService::addSemaphore(const Semaphore& semaphore) {
   semaphores_.push_back(std::make_shared<Host2DeviceSemaphore>(semaphore));
+  maybeTrackConnection(semaphores_.back()->connection());
   return semaphores_.size() - 1;
 }
 
 MSCCLPP_API_CPP SemaphoreId ProxyService::addSemaphore(std::shared_ptr<Host2DeviceSemaphore> semaphore) {
   semaphores_.push_back(semaphore);
+  maybeTrackConnection(semaphore->connection());
   return semaphores_.size() - 1;
+}
+
+void ProxyService::maybeTrackConnection(const Connection& connection) {
+  auto impl = connection.impl_;
+  for (auto const& c : connections_) {
+    if (c == impl) {
+      return;
+    }
+  }
+  connections_.push_back(impl);
+}
+
+void ProxyService::progressConnections() {
+  for (auto const& conn : connections_) {
+    if (conn) {
+      conn->progress();
+    }
+  }
 }
 
 MSCCLPP_API_CPP MemoryId ProxyService::addMemory(RegisteredMemory memory) {

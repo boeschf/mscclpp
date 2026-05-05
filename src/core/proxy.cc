@@ -20,24 +20,27 @@ constexpr int ProxyStartWarnPeriod = 1000;
 struct Proxy::Impl {
   ProxyHandler handler;
   std::function<void()> threadInit;
+  ProxyProgress progress;
   std::shared_ptr<Fifo> fifo;
   std::atomic_bool threadStarted;
   std::thread service;
   std::atomic_bool running;
 
-  Impl(ProxyHandler handler, std::function<void()> threadInit, int fifoSize)
+  Impl(ProxyHandler handler, std::function<void()> threadInit, ProxyProgress progress, int fifoSize)
       : handler(handler),
         threadInit(threadInit),
+        progress(progress),
         fifo(std::make_shared<Fifo>(fifoSize)),
         threadStarted(false),
         running(false) {}
 };
 
-MSCCLPP_API_CPP Proxy::Proxy(ProxyHandler handler, std::function<void()> threadInit, int fifoSize) {
-  pimpl_ = std::make_unique<Impl>(handler, threadInit, fifoSize);
+MSCCLPP_API_CPP Proxy::Proxy(ProxyHandler handler, std::function<void()> threadInit, int fifoSize,
+                             ProxyProgress progress) {
+  pimpl_ = std::make_unique<Impl>(handler, threadInit, progress, fifoSize);
 }
 
-MSCCLPP_API_CPP Proxy::Proxy(ProxyHandler handler, int fifoSize) {
+MSCCLPP_API_CPP Proxy::Proxy(ProxyHandler handler, int fifoSize, ProxyProgress progress) {
   int cudaDevice;
   MSCCLPP_CUDATHROW(cudaGetDevice(&cudaDevice));
   int deviceNumaNode = getDeviceNumaNode(cudaDevice);
@@ -47,7 +50,7 @@ MSCCLPP_API_CPP Proxy::Proxy(ProxyHandler handler, int fifoSize) {
       numaBind(deviceNumaNode);
     }
   };
-  pimpl_ = std::make_unique<Impl>(handler, initFunc, fifoSize);
+  pimpl_ = std::make_unique<Impl>(handler, initFunc, progress, fifoSize);
 }
 
 MSCCLPP_API_CPP Proxy::~Proxy() {
@@ -81,6 +84,9 @@ MSCCLPP_API_CPP void Proxy::start(bool blocking) {
         if (!this->pimpl_->running.load(std::memory_order_acquire)) {
           break;
         }
+      }
+      if (this->pimpl_->progress) {
+        this->pimpl_->progress();
       }
       // Poll to see if we are ready to send anything
       trigger = fifo->poll();

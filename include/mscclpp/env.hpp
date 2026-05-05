@@ -110,6 +110,13 @@ class Env {
   /// Default is false.
   const bool forceDisableNvls;
 
+  // MSCCLPP_OFI_PROVIDER
+  const std::string ofiProvider;
+
+  // MSCCLPP_OFI_DOMAIN
+  const std::string ofiDomain;
+
+
  private:
   Env();
 
