@@ -8,9 +8,9 @@
 
 #include <cstring>
 #include <mscclpp/errors.hpp>
+#include <mutex>
 
 #include "logger.hpp"
-#include <iostream>
 
 namespace mscclpp {
 
@@ -21,6 +21,9 @@ namespace {
 
 constexpr std::uint32_t kOfiEndpointFlagWriteData = 1u << 0;
 
+constexpr uint64_t kOfiBindFlagsCq = FI_TRANSMIT | FI_RECV | FI_SELECTIVE_COMPLETION;
+constexpr uint64_t kOfiBindFlagsCntr = FI_WRITE | FI_TRANSMIT;
+
 [[noreturn]] void throwOfiError(char const* what, int rc) {
   THROW(NET, Error, ErrorCode::SystemError, what, " failed: ", fi_strerror(-rc), " (rc=", rc, ")");
 }
@@ -29,6 +32,24 @@ void checkOfi(int rc, char const* what) {
   if (rc != 0) {
     throwOfiError(what, rc);
   }
+}
+
+void logOfiEndpointConfigOnce(fi_info const* baseInfo, fi_info const* epInfo, size_t queueSize,
+                              size_t cqSize, uint64_t cqBindFlags, uint64_t cntrBindFlags) {
+  static std::once_flag once;
+  std::call_once(once, [&]() {
+    INFO(NET,
+         "OFI endpoint bring-up: base tx_attr.size=", baseInfo->tx_attr ? baseInfo->tx_attr->size : 0,
+         " base rx_attr.size=", baseInfo->rx_attr ? baseInfo->rx_attr->size : 0,
+         " base tx_attr.op_flags=", baseInfo->tx_attr ? static_cast<unsigned long long>(baseInfo->tx_attr->op_flags) : 0ull,
+         " ep tx_attr.size=", epInfo->tx_attr ? epInfo->tx_attr->size : 0,
+         " ep rx_attr.size=", epInfo->rx_attr ? epInfo->rx_attr->size : 0,
+         " ep tx_attr.op_flags=", epInfo->tx_attr ? static_cast<unsigned long long>(epInfo->tx_attr->op_flags) : 0ull,
+         " qsz=", queueSize,
+         " cq.size=", cqSize,
+         " cq_bind_flags=", static_cast<unsigned long long>(cqBindFlags),
+         " cntr_bind_flags=", static_cast<unsigned long long>(cntrBindFlags));
+  });
 }
 
 #endif  // defined(MSCCLPP_USE_OFI)
@@ -81,7 +102,7 @@ OfiMemoryAttr classifyOfiMemory(void* data) {
 //}
 OfiMr::OfiMr(OfiEndpointResources& epRes, void* data, size_t size, OfiMemoryAttr const& memAttr) {
 #if defined(MSCCLPP_USE_OFI)
-  std::cout << "        OfiMr: registering memory for address " << data << " with size " << size << " using  fi_mr_reg" << std::endl;
+  DEBUG(NET, "OfiMr: registering memory for address ", data, " size=", size);
   auto& ctx = epRes.ctx();
   uint64_t mrMode = ctx.mrMode();
 
@@ -154,10 +175,12 @@ OfiMr::OfiMr(OfiEndpointResources& epRes, void* data, size_t size, OfiMemoryAttr
     checkOfi(rc, "fi_mr_enable");
   }
 
-  info_.addr = reinterpret_cast<uint64_t>(data);
+  const bool useVirtualAddress = (mrMode & FI_MR_VIRT_ADDR) != 0;
+  info_.addr = useVirtualAddress ? reinterpret_cast<uint64_t>(data) : 0;
   info_.rkey = fi_mr_key(mr_);
   info_.size = static_cast<uint64_t>(size);
-  std::cout << "        OfiMr: registered memory with addr " << info_.addr << " and rkey " << info_.rkey << std::endl;
+  INFO(NET, "OfiMr: registered addr=", info_.addr, " rkey=", info_.rkey, " size=", info_.size,
+       " mr_mode=", mrMode);
 #else
   (void)epRes;
   (void)data;
@@ -189,7 +212,7 @@ OfiCtx::OfiCtx(EndpointConfig::Ofi const& config) {
   if (hints == nullptr) {
     THROW(NET, Error, ErrorCode::SystemError, "fi_allocinfo failed");
   }
-  std::cout << "      OfiCtx: allocated hints for provider " << config.provider << " and domain " << config.domain << std::endl;
+  DEBUG(NET, "OfiCtx: allocated hints for provider ", config.provider, " domain=", config.domain);
 
   try {
     hints->domain_attr->mr_mode = FI_MR_ENDPOINT | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
@@ -198,8 +221,7 @@ OfiCtx::OfiCtx(EndpointConfig::Ofi const& config) {
     hints->ep_attr->type = FI_EP_RDM;
     //hints->domain_attr->threading = FI_THREAD_DOMAIN;
     hints->domain_attr->threading = FI_THREAD_SAFE;
-    hints->domain_attr->control_progress = FI_PROGRESS_MANUAL;
-    hints->domain_attr->data_progress = FI_PROGRESS_MANUAL;
+    // Use provider defaults for progress mode.
 
     if (!config.provider.empty()) {
       hints->fabric_attr->prov_name = strdup(config.provider.c_str());
@@ -216,31 +238,32 @@ OfiCtx::OfiCtx(EndpointConfig::Ofi const& config) {
       }
     }
 
-    std::cout << "      OfiCtx: attempting fi_getinfo for provider " << config.provider << " and domain " << config.domain << std::endl;
+    DEBUG(NET, "OfiCtx: attempting fi_getinfo for provider ", config.provider, " domain=", config.domain);
     // Keep this at a generic version for endpoint/domain bring-up.
     int rc = fi_getinfo(FI_VERSION(2, 5), nullptr, nullptr, 0, hints, &info_);
     fi_freeinfo(hints);
     hints = nullptr;
-    std::cout << "      checking ofi" << std::endl;
     checkOfi(rc, "fi_getinfo(OfiCtx)");
-    std::cout << "      OfiCtx: fi_getinfo succeeded for provider " << config.provider << " and domain " << config.domain << std::endl;
+    INFO(NET, "OfiCtx: fi_getinfo succeeded for provider ", config.provider, " domain=", config.domain,
+         " mr_mode=", info_->domain_attr ? info_->domain_attr->mr_mode : 0,
+         " caps=", info_->caps);
 
     caps_ = info_->caps;
     mrMode_ = info_->domain_attr->mr_mode;
 
     rc = fi_fabric(info_->fabric_attr, &fabric_, nullptr);
     checkOfi(rc, "fi_fabric(OfiCtx)");
-    std::cout << "      OfiCtx: fi_fabric succeeded for provider " << config.provider << " and domain " << config.domain << std::endl;
+    DEBUG(NET, "OfiCtx: fi_fabric succeeded for provider ", config.provider, " domain=", config.domain);
 
     rc = fi_domain(fabric_, info_, &domain_, nullptr);
     checkOfi(rc, "fi_domain(OfiCtx)");
-    std::cout << "      OfiCtx: fi_domain succeeded for provider " << config.provider << " and domain " << config.domain << std::endl;
+    DEBUG(NET, "OfiCtx: fi_domain succeeded for provider ", config.provider, " domain=", config.domain);
   } catch (...) {
     if (hints != nullptr) {
       fi_freeinfo(hints);
     }
-    std::cout << "    OfiCtx: exception during initialization, closing any opened resources for provider " << config.provider
-              << " and domain " << config.domain << std::endl;
+    WARN(NET, "OfiCtx: exception during initialization, closing resources for provider ", config.provider,
+         " domain=", config.domain);
     closeAll();
     throw;
   }
@@ -289,15 +312,16 @@ OfiEndpointResources::OfiEndpointResources(OfiCtx& ctx, EndpointConfig const& co
     epInfo->rx_attr->size = qsz;
 
     //epInfo->tx_attr->op_flags |= (FI_INJECT_COMPLETE | FI_COMPLETION);
+    epInfo->tx_attr->op_flags = 0;
 
-    std::cout << "      OfiEndpointResources: creating AV for provider " << ctx.info()->fabric_attr->prov_name
-              << " and domain " << ctx.info()->domain_attr->name << std::endl;
+    DEBUG(NET, "OfiEndpointResources: creating AV for provider ", ctx.info()->fabric_attr->prov_name,
+          " domain=", ctx.info()->domain_attr->name);
     fi_av_attr avAttr = {};
     avAttr.type = FI_AV_TABLE;
     int rc = fi_av_open(ctx.domain(), &avAttr, &av_, nullptr);
     checkOfi(rc, "fi_av_open");
-    std::cout << "      OfiEndpointResources: AV created for provider " << ctx.info()->fabric_attr->prov_name
-              << " and domain " << ctx.info()->domain_attr->name << std::endl;
+    DEBUG(NET, "OfiEndpointResources: AV created for provider ", ctx.info()->fabric_attr->prov_name,
+          " domain=", ctx.info()->domain_attr->name);
 
     fi_cq_attr cqAttr = {};
     cqAttr.format = FI_CQ_FORMAT_CONTEXT;
@@ -305,51 +329,54 @@ OfiEndpointResources::OfiEndpointResources(OfiCtx& ctx, EndpointConfig const& co
     cqAttr.wait_obj = FI_WAIT_NONE;
     //cqAttr.size = (config.maxWriteQueueSize > 0) ? static_cast<size_t>(config.maxWriteQueueSize) : 1024;
     cqAttr.size = std::max<size_t>(qsz, epInfo->tx_attr->size + epInfo->rx_attr->size);
+
+    logOfiEndpointConfigOnce(ctx.info(), epInfo, qsz, cqAttr.size, kOfiBindFlagsCq, kOfiBindFlagsCntr);
+
     rc = fi_cq_open(ctx.domain(), &cqAttr, &cq_, nullptr);
     checkOfi(rc, "fi_cq_open");
-    std::cout << "      OfiEndpointResources: CQ created for provider " << ctx.info()->fabric_attr->prov_name
-              << " and domain " << ctx.info()->domain_attr->name << std::endl;
+    DEBUG(NET, "OfiEndpointResources: CQ created for provider ", ctx.info()->fabric_attr->prov_name,
+          " domain=", ctx.info()->domain_attr->name);
 
     fi_cntr_attr cntrAttr = {};
     cntrAttr.events = FI_CNTR_EVENTS_COMP;
     cntrAttr.wait_obj = FI_WAIT_NONE;
     rc = fi_cntr_open(ctx.domain(), &cntrAttr, &txCntr_, nullptr);
     checkOfi(rc, "fi_cntr_open");
-    std::cout << "      OfiEndpointResources: CNTR created for provider " << ctx.info()->fabric_attr->prov_name
-              << " and domain " << ctx.info()->domain_attr->name << std::endl;
+    DEBUG(NET, "OfiEndpointResources: CNTR created for provider ", ctx.info()->fabric_attr->prov_name,
+          " domain=", ctx.info()->domain_attr->name);
 
     //rc = fi_endpoint(ctx.domain(), ctx.info(), &ep_, nullptr);
     rc = fi_endpoint(ctx.domain(), epInfo, &ep_, nullptr);
     checkOfi(rc, "fi_endpoint");
-    std::cout << "      OfiEndpointResources: EP created for provider " << ctx.info()->fabric_attr->prov_name
-              << " and domain " << ctx.info()->domain_attr->name << std::endl;
+    DEBUG(NET, "OfiEndpointResources: EP created for provider ", ctx.info()->fabric_attr->prov_name,
+          " domain=", ctx.info()->domain_attr->name);
 
     rc = fi_ep_bind(ep_, &av_->fid, 0);
     checkOfi(rc, "fi_ep_bind(AV)");
-    std::cout << "      OfiEndpointResources: EP bound to AV for provider " << ctx.info()->fabric_attr->prov_name
-              << " and domain " << ctx.info()->domain_attr->name << std::endl;
+    DEBUG(NET, "OfiEndpointResources: EP bound to AV for provider ", ctx.info()->fabric_attr->prov_name,
+          " domain=", ctx.info()->domain_attr->name);
 
     //rc = fi_ep_bind(ep_, &cq_->fid, FI_TRANSMIT | FI_RECV);
     //rc = fi_ep_bind(ep_, &cq_->fid, FI_TRANSMIT | FI_RECV | FI_SELECTIVE_COMPLETION);
-    rc = fi_ep_bind(ep_, &cq_->fid, FI_TRANSMIT | FI_SELECTIVE_COMPLETION);
+    rc = fi_ep_bind(ep_, &cq_->fid, kOfiBindFlagsCq);
     //rc = fi_ep_bind(ep_, &cq_->fid, FI_TRANSMIT);
     checkOfi(rc, "fi_ep_bind(CQ)");
-    std::cout << "      OfiEndpointResources: EP bound to CQ for provider " << ctx.info()->fabric_attr->prov_name
-              << " and domain " << ctx.info()->domain_attr->name << std::endl;
+    DEBUG(NET, "OfiEndpointResources: EP bound to CQ for provider ", ctx.info()->fabric_attr->prov_name,
+          " domain=", ctx.info()->domain_attr->name, " flags=", static_cast<unsigned long long>(kOfiBindFlagsCq));
 
-    rc = fi_ep_bind(ep_, &txCntr_->fid, FI_WRITE);
+    rc = fi_ep_bind(ep_, &txCntr_->fid, kOfiBindFlagsCntr);
     checkOfi(rc, "fi_ep_bind(CNTR)");
-    std::cout << "      OfiEndpointResources: EP bound to CNTR for provider " << ctx.info()->fabric_attr->prov_name
-              << " and domain " << ctx.info()->domain_attr->name << std::endl;
+    DEBUG(NET, "OfiEndpointResources: EP bound to CNTR for provider ", ctx.info()->fabric_attr->prov_name,
+          " domain=", ctx.info()->domain_attr->name, " flags=", static_cast<unsigned long long>(kOfiBindFlagsCntr));
 
     rc = fi_enable(ep_);
     checkOfi(rc, "fi_enable");
-    std::cout << "      OfiEndpointResources: EP enabled for provider " << ctx.info()->fabric_attr->prov_name
-              << " and domain " << ctx.info()->domain_attr->name << std::endl;
+    INFO(NET, "OfiEndpointResources: EP enabled for provider ", ctx.info()->fabric_attr->prov_name,
+         " domain=", ctx.info()->domain_attr->name);
 
     cacheAddress();
-    std::cout << "      OfiEndpointResources: address cached for provider " << ctx.info()->fabric_attr->prov_name
-              << " and domain " << ctx.info()->domain_attr->name << std::endl;
+    DEBUG(NET, "OfiEndpointResources: address cached for provider ", ctx.info()->fabric_attr->prov_name,
+          " domain=", ctx.info()->domain_attr->name, " addr_bytes=", addr_.size());
 
     supportsWriteData_ = false;
     if (supportsWriteData_) {

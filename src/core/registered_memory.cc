@@ -19,8 +19,6 @@
 #include "unix_socket.hpp"
 #include "utils_internal.hpp"
 
-#include <iostream>
-
 #define MSCCLPP_CULOG_WARN(cmd)                                         \
   do {                                                                  \
     CUresult err = cmd;                                                 \
@@ -81,7 +79,8 @@ RegisteredMemory::Impl::Impl(void* data, size_t size, TransportFlags transports,
       hostHash(getHostHash()),
       pidHash(getPidHash()),
       transports(transports) {
-  std::cout << "RegisteredMemory::Impl constructor called with data=" << data << ", size=" << size << std::endl;
+  DEBUG(NET, "RegisteredMemory::Impl ctor data=", data, " size=", size,
+        " transport_count=", transports.count());
 
   registerNonOfiLocalTransports(data, size, transports, contextImpl);
 

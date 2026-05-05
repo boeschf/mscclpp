@@ -668,6 +668,10 @@ struct OfiConnection::Impl {
 #endif  // defined(MSCCLPP_USE_OFI)
   uint64_t outstandingTx = 0;
   uint64_t postedWrites = 0;
+  uint64_t writesPostedNoCq = 0;
+  uint64_t writesPostedCq = 0;
+  uint64_t cqCompletionsSeen = 0;
+  uint64_t cntrCompletionsSeen = 0;
   bool useWriteDataSignal = false;
 
   std::unique_ptr<uint64_t> updateScratch;
@@ -761,9 +765,6 @@ void OfiConnection::write(RegisteredMemory dst, uint64_t dstOffset, RegisteredMe
   if (!impl_ || !impl_->resources) {
     THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
   }
-  std::cout << "OfiConnection::write: dstOffset=" << dstOffset << ", srcOffset=" << srcOffset << ", size=" << size
-            << std::endl;
-
   validateTransport(dst, remoteTransport(), dstOffset, size);
   validateTransport(src, transport(), srcOffset, size);
 
@@ -797,13 +798,16 @@ void OfiConnection::write(RegisteredMemory dst, uint64_t dstOffset, RegisteredMe
 
   //++impl_->outstandingTx;
   ++impl_->postedWrites;
+  ++impl_->writesPostedNoCq;
 
   INFO(CONN, "OfiConnection write: local=", localBuf,
        " remote=", reinterpret_cast<void*>(remoteAddr),
        " size=", size,
        " rkey=", dstData.ofiMrInfo.rkey,
-       " outstandingTx=", impl_->outstandingTx,
-       " postedWrites=", impl_->postedWrites
+        " outstandingTx=", impl_->outstandingTx,
+       " postedWrites=", impl_->postedWrites,
+       " writesPostedNoCq=", impl_->writesPostedNoCq,
+       " writesPostedCq=", impl_->writesPostedCq
        );
 
   //iovec localIov = {};
@@ -866,8 +870,6 @@ void OfiConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint
   if (src == nullptr) {
     THROW(CONN, Error, ErrorCode::InvalidUsage, "src must not be null");
   }
-  std::cout << "OfiConnection::updateAndSync: dstOffset=" << dstOffset << ", newValue=" << newValue << std::endl;
-
   validateTransport(dst, remoteTransport(), dstOffset, sizeof(uint64_t));
 
   auto dstTransportInfo = getImpl(dst).getTransportInfo(remoteTransport());
@@ -882,9 +884,6 @@ void OfiConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint
   *impl_->updateScratch = newValue;
 
   Impl::CompletionContext op{};
-  std::cout << "Address of op context: " << static_cast<void*>(&op) << std::endl;
-  INFO(mscclpp::CONN, "Address of op context: %p", static_cast<void*>(&op));
-
   flush(-1);
 
   //for (;;) {
@@ -984,6 +983,7 @@ void OfiConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint
     int rc = fi_writemsg(impl_->resources->ep(), &msg, FI_COMPLETION);
     if (rc == 0) {
       ++impl_->outstandingTx;
+      ++impl_->writesPostedCq;
       break;
     }
 
@@ -1000,11 +1000,13 @@ void OfiConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint
   INFO(CONN, "OfiConnection updateAndSync: value ", oldValue, " -> ", newValue,
        " remote=", reinterpret_cast<void*>(remoteIov.addr),
        " rkey=", remoteIov.key,
-       " outstandingTx=", impl_->outstandingTx);
+       " outstandingTx=", impl_->outstandingTx,
+       " writesPostedNoCq=", impl_->writesPostedNoCq,
+       " writesPostedCq=", impl_->writesPostedCq,
+       " cqCompletionsSeen=", impl_->cqCompletionsSeen,
+       " cntrCompletionsSeen=", impl_->cntrCompletionsSeen);
 
-  std::cout << "OfiConnection::updateAndSync: waiting for completion of update..." << std::endl;
-  waitForCompletions(-1, &op, /*drainAll=*/false);
-  std::cout << "OfiConnection::updateAndSync: update completed" << std::endl;
+  waitForCompletions(5 * 1000 * 1000, &op, /*drainAll=*/false);
 #else
   (void)dst;
   (void)dstOffset;
@@ -1051,13 +1053,25 @@ void OfiConnection::flush(int64_t timeoutUsec) {
           ? std::chrono::steady_clock::time_point::max()
           : std::chrono::steady_clock::now() + std::chrono::microseconds(timeoutUsec);
 
-  while (fi_cntr_read(impl_->resources->txCntr()) < target) {
+  while (true) {
+    const auto completed = fi_cntr_read(impl_->resources->txCntr());
+    impl_->cntrCompletionsSeen = completed;
+    if (completed >= target) {
+      break;
+    }
     if (timeoutUsec >= 0 && std::chrono::steady_clock::now() >= deadline) {
       THROW(CONN, Error, ErrorCode::Aborted,
             "OfiConnection::flush timed out waiting for write counter");
     }
     std::this_thread::yield();
   }
+
+  INFO(CONN, "OfiConnection::flush: postedWrites=", impl_->postedWrites,
+       " writesPostedNoCq=", impl_->writesPostedNoCq,
+       " writesPostedCq=", impl_->writesPostedCq,
+       " cntrCompletionsSeen=", impl_->cntrCompletionsSeen,
+       " cqCompletionsSeen=", impl_->cqCompletionsSeen,
+       " outstandingTx=", impl_->outstandingTx);
 #else
   (void)timeoutUsec;
   THROW(CONN, Error, ErrorCode::InvalidUsage,
@@ -1074,9 +1088,8 @@ bool OfiConnection::progressCompletionsOnce() {
   fi_cq_entry entries[8];
   auto rc = fi_cq_read(impl_->resources->cq(), entries, 8);
 
-  std::cout << "OfiConnection::progressCompletionsOnce: fi_cq_read returned " << rc << std::endl;
-
   if (rc > 0) {
+    impl_->cqCompletionsSeen += static_cast<uint64_t>(rc);
     for (ssize_t i = 0; i < rc; ++i) {
       if (impl_->outstandingTx == 0) {
         THROW(CONN, Error, ErrorCode::InternalError,
@@ -1089,6 +1102,11 @@ bool OfiConnection::progressCompletionsOnce() {
         ctx->done = true;
       }
     }
+    INFO(CONN, "OfiConnection::progressCompletionsOnce: cq batch=", rc,
+         " cqCompletionsSeen=", impl_->cqCompletionsSeen,
+         " writesPostedNoCq=", impl_->writesPostedNoCq,
+         " writesPostedCq=", impl_->writesPostedCq,
+         " outstandingTx=", impl_->outstandingTx);
     return true;
   }
 
