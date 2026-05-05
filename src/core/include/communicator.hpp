@@ -80,8 +80,6 @@ struct Communicator::Impl {
   std::shared_ptr<BaseRecvItem> getLastRecvItem(int remoteRank, int tag);
 
   struct Connector;
-
-  //int peerRank(Connection const& connection) const;
 };
 
 }  // namespace mscclpp
