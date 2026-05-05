@@ -101,8 +101,14 @@ auto useIB = [](int rank1, int rank2, int nranksPerNode) {
 
 auto useOfi = [](int rank1, int rank2, int nranksPerNode) {
   bool inSameNode = rank1 / nranksPerNode == rank2 / nranksPerNode;
-  //TODO
-  return !inSameNode;
+#if defined(MSCCLPP_USE_OFI)
+  return !hasIBDevices() && !inSameNode;
+#else
+  (void)rank1;
+  (void)rank2;
+  (void)nranksPerNode;
+  return false;
+#endif
 };
 
 static const mscclpp::Transport IBs[] = {mscclpp::Transport::IB0, mscclpp::Transport::IB1, mscclpp::Transport::IB2,
@@ -226,8 +232,8 @@ struct Executor::Impl {
       } else if (type == ChannelType::PORT) {
         if (useIB(rank, info.accessRank, this->nranksPerNode)) {
           flags |= IBs[rank % this->nranksPerNode];
-        //} else if (useOfi(rank, info.accessRank, this->nranksPerNode)) {
-        //  flags |= Transport::Ofi;
+        } else if (useOfi(rank, info.accessRank, this->nranksPerNode)) {
+          flags |= Transport::Ofi;
         } else {
           flags |= Transport::CudaIpc;
         }
@@ -277,8 +283,12 @@ struct Executor::Impl {
     std::vector<int> connectedPeers = plan.impl_->getConnectedPeers();
     std::vector<std::shared_future<mscclpp::Connection>> connectionFutures;
     for (int peer : connectedPeers) {
-      Transport transport =
-          !useIB(rank, peer, this->nranksPerNode) ? Transport::CudaIpc : IBs[rank % this->nranksPerNode];
+      Transport transport = Transport::CudaIpc;
+      if (useIB(rank, peer, this->nranksPerNode)) {
+        transport = IBs[rank % this->nranksPerNode];
+      } else if (useOfi(rank, peer, this->nranksPerNode)) {
+        transport = Transport::Ofi;
+      }
       connectionFutures.push_back(this->comm->connect(transport, peer));
     }
     for (size_t i = 0; i < connectionFutures.size(); i++) {
