@@ -238,9 +238,10 @@ RegisteredMemory::Impl::Impl(const std::vector<char>::const_iterator& begin,
     // When transports include both CudaIpc and IB (e.g., CudaIpc | IB0),
     // try CudaIpc first and fall back to IB on failure.
     auto entry = getTransportInfo(Transport::CudaIpc);
+    auto& cudaIpcData = std::get<TransportInfoType<Transport::CudaIpc>>(entry.data);
     bool hasIB = (transports & AllIBTransports).any();
     try {
-      auto gpuIpcMem = GpuIpcMem::create(entry.gpuIpcMemHandle);
+      auto gpuIpcMem = GpuIpcMem::create(cudaIpcData.gpuIpcMemHandle);
       this->remoteMemMap = gpuIpcMem->map();
       this->data = this->remoteMemMap.get();
     } catch (const BaseError& e) {

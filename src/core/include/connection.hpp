@@ -111,7 +111,7 @@ class IBConnection : public BaseConnection {
   std::weak_ptr<IbQp> qp_;
   std::unique_ptr<uint64_t> atomicSrc_;
   RegisteredMemory atomicSrcMem_;
-  mscclpp::TransportInfo atomicSrcTransportInfo_;
+  detail::TransportInfo<IBTransportTag> atomicSrcTransportInfo_;
 
   // For write-with-imm mode (HostNoAtomic): uses RDMA write-with-imm to signal
   // instead of atomic operations, with a host thread forwarding to GPU for memory consistency.

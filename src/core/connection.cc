@@ -289,7 +289,8 @@ IBConnection::IBConnection(std::shared_ptr<Context> context, const Endpoint& loc
   qp_.lock()->rts();
   atomicSrcMem_ = context->registerMemory(atomicSrc_.get(), sizeof(uint64_t), transport_);
   validateTransport(atomicSrcMem_, transport_);
-  atomicSrcTransportInfo_ = getImpl(atomicSrcMem_).getTransportInfo(transport_);
+  atomicSrcTransportInfo_ =
+      std::get<detail::TransportInfo<IBTransportTag>>(getImpl(atomicSrcMem_).getTransportInfo(transport_).data);
 
   if (ibNoAtomic_) {
 #if defined(MSCCLPP_USE_CUDA)
