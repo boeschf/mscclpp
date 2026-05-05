@@ -71,23 +71,36 @@ void worker(int rank, int gpuId, const std::string& ipPort, mscclpp::Transport t
   // Build a connection and a semaphore
   auto bootstrap = std::make_shared<mscclpp::TcpBootstrap>(myRank, nRanks);
   bootstrap->initialize(ipPort);
+  log("Rank ", myRank, " (GPU ", gpuId, "): Building Communicator ...");
   mscclpp::Communicator comm(bootstrap);
+
+  log("Rank ", myRank, " (GPU ", gpuId, "): Connecting ...");
   auto conn = comm.connect({transport, {mscclpp::DeviceType::GPU, gpuId}}, remoteRank).get();
-  auto sema = comm.buildSemaphore(conn, remoteRank).get();
 
+  log("Rank ", myRank, " (GPU ", gpuId, "): Building Semaphore ...");
+  //auto sema = comm.buildSemaphore(conn, remoteRank).get();
+  auto sema = comm.buildSemaphore2(conn).get();
+
+  log("Rank ", myRank, " (GPU ", gpuId, "): Registering Memory ...");
   mscclpp::GpuBuffer buffer(bufferBytes);
-  mscclpp::RegisteredMemory localRegMem = comm.registerMemory(buffer.data(), buffer.bytes(), transport);
+  //mscclpp::RegisteredMemory localRegMem = comm.registerMemory(buffer.data(), buffer.bytes(), transport);
+  mscclpp::RegisteredMemory localRegMem = comm.registerMemory(buffer.data(), buffer.bytes(), transport, conn);
 
-  comm.sendMemory(localRegMem, remoteRank);
-  auto remoteRegMemFuture = comm.recvMemory(remoteRank);
+  log("Rank ", myRank, " (GPU ", gpuId, "): Exchanging Memory ...");
+  //comm.sendMemory(localRegMem, remoteRank);
+  comm.sendMemory2(localRegMem);
+  //auto remoteRegMemFuture = comm.recvMemory(remoteRank);
+  auto remoteRegMemFuture = comm.recvMemory2(conn);
   mscclpp::RegisteredMemory remoteRegMem = remoteRegMemFuture.get();
 
+  log("Rank ", myRank, " (GPU ", gpuId, "): Setting up Proxy Service ...");
   mscclpp::ProxyService proxyService;
   mscclpp::SemaphoreId semaId = proxyService.addSemaphore(sema);
   mscclpp::MemoryId localMemId = proxyService.addMemory(localRegMem);
   mscclpp::MemoryId remoteMemId = proxyService.addMemory(remoteRegMem);
   mscclpp::PortChannel portChan = proxyService.portChannel(semaId, remoteMemId, localMemId);
 
+  log("Rank ", myRank, " (GPU ", gpuId, "): Running Tests ...");
   auto portChanHandle = portChan.deviceHandle();
 
   void* devHandle;
@@ -177,13 +190,14 @@ mscclpp::Transport parseTransport(const std::string& transportStr) {
   if (transportStr == "IB6") return mscclpp::Transport::IB6;
   if (transportStr == "IB7") return mscclpp::Transport::IB7;
   if (transportStr == "Ethernet") return mscclpp::Transport::Ethernet;
+  if (transportStr == "Ofi") return mscclpp::Transport::Ofi;
   throw std::runtime_error("Unknown transport: " + transportStr);
 }
 
 int main(int argc, char** argv) {
   if (argc == 1) {
-    int pid0 = spawn_process([]() { worker(0, 0, "lo:127.0.0.1:" PORT_NUMBER, mscclpp::Transport::CudaIpc); });
-    int pid1 = spawn_process([]() { worker(1, 1, "lo:127.0.0.1:" PORT_NUMBER, mscclpp::Transport::CudaIpc); });
+    int pid0 = spawn_process([]() { worker(0, 0, "lo:127.0.0.1:" PORT_NUMBER, mscclpp::Transport::Ofi); });
+    int pid1 = spawn_process([]() { worker(1, 1, "lo:127.0.0.1:" PORT_NUMBER, mscclpp::Transport::Ofi); });
     if (pid0 < 0 || pid1 < 0) {
       log("Failed to spawn processes.");
       return -1;

@@ -9,6 +9,7 @@
 #include "api.h"
 #include "context.hpp"
 #include "ib.hpp"
+#include "ofi.hpp"
 #include "logger.hpp"
 #include "registered_memory.hpp"
 #include "serialization.hpp"
@@ -68,6 +69,26 @@ Endpoint::Impl::Impl(const EndpointConfig& config, Context::Impl& contextImpl)
     socket_ = std::make_unique<Socket>(&socketAddress_, MSCCLPP_SOCKET_MAGIC, SocketTypeBootstrap, abortFlag_);
     socket_->bindAndListen();
     socketAddress_ = socket_->getAddr();
+  } else if (config_.transport == Transport::Ofi) {
+#if defined(MSCCLPP_USE_OFI)
+      if (config_.ofi.provider.empty()) config_.ofi.provider = env()->ofiProvider;
+      if (config_.ofi.domain.empty()) config_.ofi.domain = env()->ofiDomain;
+      if (config_.ofi.domain.empty()) {
+        // domain =  cxiX, where X=config_.device.id
+        config_.ofi.domain = "cxi" + std::to_string(config_.device.id);
+      }
+      INFO(NET, "Endpoint OFI config: provider=", config_.ofi.provider, " domain=", config_.ofi.domain);
+      contextImpl.bindOfiConfig(config_.ofi);
+      if (config_.maxWriteQueueSize <= 0) {
+        config_.maxWriteQueueSize = 1024;
+      }
+      ofiResources_ = contextImpl.createOfiEndpointResources(config_);
+      ofiWireInfo_.flags = ofiResources_->flags();
+      ofiWireInfo_.addr = ofiResources_->address();
+      INFO(NET, "Endpoint OFI wire info: flags=", ofiWireInfo_.flags, " addr_bytes=", ofiWireInfo_.addr.size());
+#else
+      throw Error("OFI transport is not supported in this build", ErrorCode::InvalidUsage);
+#endif
   }
 }
 
@@ -82,6 +103,8 @@ Endpoint::Impl::Impl(const std::vector<char>& serialization) {
     it = detail::deserialize(it, ibNoAtomic_);
   } else if (config_.transport == Transport::Ethernet) {
     it = detail::deserialize(it, socketAddress_);
+  } else if (config_.transport == Transport::Ofi) {
+    it = detail::deserialize(it, ofiWireInfo_);
   }
   if (it != serialization.end()) {
     throw Error("Endpoint deserialization failed", ErrorCode::Aborted);
@@ -112,6 +135,8 @@ MSCCLPP_API_CPP std::vector<char> Endpoint::serialize() const {
     detail::serialize(data, pimpl_->ibNoAtomic_);
   } else if (pimpl_->config_.transport == Transport::Ethernet) {
     detail::serialize(data, pimpl_->socketAddress_);
+  } else if (pimpl_->config_.transport == Transport::Ofi) {
+    detail::serialize(data, pimpl_->ofiWireInfo_);
   }
   return data;
 }

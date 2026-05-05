@@ -99,6 +99,12 @@ auto useIB = [](int rank1, int rank2, int nranksPerNode) {
   return hasIBDevices() && !inSameNode;
 };
 
+auto useOfi = [](int rank1, int rank2, int nranksPerNode) {
+  bool inSameNode = rank1 / nranksPerNode == rank2 / nranksPerNode;
+  //TODO
+  return !inSameNode;
+};
+
 static const mscclpp::Transport IBs[] = {mscclpp::Transport::IB0, mscclpp::Transport::IB1, mscclpp::Transport::IB2,
                                          mscclpp::Transport::IB3, mscclpp::Transport::IB4, mscclpp::Transport::IB5,
                                          mscclpp::Transport::IB6, mscclpp::Transport::IB7};
@@ -220,8 +226,11 @@ struct Executor::Impl {
       } else if (type == ChannelType::PORT) {
         if (useIB(rank, info.accessRank, this->nranksPerNode)) {
           flags |= IBs[rank % this->nranksPerNode];
-        } else
+        //} else if (useOfi(rank, info.accessRank, this->nranksPerNode)) {
+        //  flags |= Transport::Ofi;
+        } else {
           flags |= Transport::CudaIpc;
+        }
       }
     }
     return flags;

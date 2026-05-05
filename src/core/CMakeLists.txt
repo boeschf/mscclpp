@@ -3,6 +3,17 @@
 
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS *.cc *.cpp *.cu)
 
+if(NOT MSCCLPP_USE_IB)
+  list(REMOVE_ITEM SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/ibverbs_wrapper.cc
+  )
+endif()
+if(NOT MSCCLPP_USE_OFI)
+  list(REMOVE_ITEM SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/ofi_wrapper.cc
+  )
+endif()
+
 # Handle ROCm specific source property
 if(MSCCLPP_USE_ROCM)
     file(GLOB_RECURSE CU_SOURCES *.cu)
@@ -38,6 +49,11 @@ if(MSCCLPP_USE_GDRCOPY)
     target_include_directories(mscclpp_obj SYSTEM PRIVATE ${GDRCOPY_INCLUDE_DIRS})
     target_link_libraries(mscclpp_obj PRIVATE ${GDRCOPY_LIBRARIES})
     target_compile_definitions(mscclpp_obj PRIVATE MSCCLPP_USE_GDRCOPY)
+endif()
+
+if(MSCCLPP_USE_OFI)
+    target_link_libraries(mscclpp_obj PRIVATE Libfabric::Libfabric)
+    target_compile_definitions(mscclpp_obj PUBLIC MSCCLPP_USE_OFI)
 endif()
 
 set_target_properties(mscclpp_obj PROPERTIES LINKER_LANGUAGE CXX POSITION_INDEPENDENT_CODE 1 VERSION ${MSCCLPP_VERSION} SOVERSION ${MSCCLPP_SOVERSION})
