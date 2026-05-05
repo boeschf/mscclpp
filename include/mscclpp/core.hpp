@@ -213,16 +213,47 @@ enum class Transport {
   IB6,            // InfiniBand device 6 transport type.
   IB7,            // InfiniBand device 7 transport type.
   Ethernet,       // Ethernet transport type.
+  Ofi,            // Libfabric with cxi provider
   NumTransports,  // The number of transports.
 };
 
 namespace detail {
-const size_t TransportFlagsSize = 11;
+inline constexpr size_t TransportFlagsSize = 12;
 static_assert(TransportFlagsSize == static_cast<size_t>(Transport::NumTransports),
               "TransportFlagsSize must match the number of transports");
 /// Bitset for storing transport flags.
 using TransportFlagsBase = std::bitset<TransportFlagsSize>;
+
+using TransportTagType = std::underlying_type_t<Transport>;
+template <Transport T>
+struct TransportTagTrait {
+    inline static constexpr TransportTagType tag = static_cast<TransportTagType>(T);
+};
+
+template<>
+struct TransportTagTrait<Transport::IB0> {
+    inline static constexpr TransportTagType tag = static_cast<TransportTagType>(Transport::NumTransports) + 1u;
+};
+template<>
+struct TransportTagTrait<Transport::IB1> : TransportTagTrait<Transport::IB0> {};
+template<>
+struct TransportTagTrait<Transport::IB2> : TransportTagTrait<Transport::IB0> {};
+template<>
+struct TransportTagTrait<Transport::IB3> : TransportTagTrait<Transport::IB0> {};
+template<>
+struct TransportTagTrait<Transport::IB4> : TransportTagTrait<Transport::IB0> {};
+template<>
+struct TransportTagTrait<Transport::IB5> : TransportTagTrait<Transport::IB0> {};
+template<>
+struct TransportTagTrait<Transport::IB6> : TransportTagTrait<Transport::IB0> {};
+template<>
+struct TransportTagTrait<Transport::IB7> : TransportTagTrait<Transport::IB0> {};
+
 }  // namespace detail
+
+using TransportTagType = detail::TransportTagType;
+inline constexpr TransportTagType IBTransportTag = detail::TransportTagTrait<Transport::IB0>::tag;
+
 
 /// Stores transport flags.
 class TransportFlags : private detail::TransportFlagsBase {
@@ -439,6 +470,11 @@ struct EndpointConfig {
           mode(mode) {}
   };
 
+  struct Ofi {
+    std::string provider;
+    std::string domain;
+  };
+
   /// Communication transport type (e.g., CudaIpc, IB0-IB7, Ethernet).
   Transport transport;
   /// Target device for the endpoint (GPU or CPU with optional device ID).
@@ -447,6 +483,8 @@ struct EndpointConfig {
   int maxWriteQueueSize;
   /// InfiniBand-specific options (used only for Transport::IBx).
   Ib ib;
+  // Libfabric-specific options (used only for Transport::Ofi).
+  Ofi ofi;
 
   /// Constructs endpoint configuration with specified transport, device, and optional settings.
   /// @param transport Communication transport to use.
@@ -454,8 +492,8 @@ struct EndpointConfig {
   /// @param maxWriteQueueSize Maximum write queue size (-1 for system default).
   /// @param ib IB-specific configuration.
   EndpointConfig(Transport transport = Transport::Unknown, Device device = DeviceType::GPU, int maxWriteQueueSize = -1,
-                 Ib ib = {})
-      : transport(transport), device(device), maxWriteQueueSize(maxWriteQueueSize), ib(ib) {}
+                 Ib ib = {}, Ofi ofi = {})
+      : transport(transport), device(device), maxWriteQueueSize(maxWriteQueueSize), ib(ib), ofi{ofi} {}
 };
 
 class Context;
@@ -545,6 +583,8 @@ class Context : public std::enable_shared_from_this<Context> {
   /// @return A RegisteredMemory object representing the registered memory region.
   RegisteredMemory registerMemory(void* ptr, size_t size, TransportFlags transports);
 
+  RegisteredMemory registerMemory(void* ptr, size_t size, TransportFlags transports, const Connection& connection);
+
   /// Create an endpoint for establishing connections.
   ///
   /// @param config The configuration for the endpoint.
@@ -607,6 +647,12 @@ class RegisteredMemory {
   /// @param data A vector of characters representing a serialized RegisteredMemory object.
   /// @return A deserialized RegisteredMemory object.
   static RegisteredMemory deserialize(const std::vector<char>& data);
+
+  bool hasConnection() const;
+
+  Connection connection() const;
+
+  void bindConnection(Connection const& connection);
 
  private:
   struct Impl;
@@ -827,6 +873,8 @@ class Communicator {
   /// @return A RegisteredMemory object representing the registered memory region.
   RegisteredMemory registerMemory(void* ptr, size_t size, TransportFlags transports);
 
+  RegisteredMemory registerMemory(void* ptr, size_t size, TransportFlags transports, const Connection& connection);
+
   /// Send information of a registered memory to the remote side.
   ///
   /// The send will be started upon calling this function, but this function returns immediately without
@@ -843,6 +891,8 @@ class Communicator {
   /// @param tag The tag to use for identifying the send.
   ///
   void sendMemory(RegisteredMemory memory, int remoteRank, int tag = 0);
+
+  void sendMemory2(const RegisteredMemory& memory, int tag = 0);
 
   [[deprecated("Use sendMemory() instead. This will be removed in a future release.")]] void sendMemoryOnSetup(
       RegisteredMemory memory, int remoteRank, int tag) {
@@ -872,6 +922,8 @@ class Communicator {
   /// @return A future of registered memory.
   ///
   std::shared_future<RegisteredMemory> recvMemory(int remoteRank, int tag = 0);
+
+  std::shared_future<RegisteredMemory> recvMemory2(const Connection& connection, int tag = 0);
 
   [[deprecated(
       "Use recvMemory() instead. This will be removed in a future release.")]] NonblockingFuture<RegisteredMemory>
@@ -922,6 +974,7 @@ class Communicator {
   /// @param tag The tag to use for identifying the operation.
   /// @return A future of the built semaphore.
   std::shared_future<Semaphore> buildSemaphore(const Connection& connection, int remoteRank, int tag = 0);
+  std::shared_future<Semaphore> buildSemaphore2(const Connection& connection, int tag = 0);
 
   /// Get the remote rank a connection is connected to.
   ///

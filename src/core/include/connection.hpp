@@ -16,6 +16,7 @@
 #include "context.hpp"
 #include "endpoint.hpp"
 #include "ib.hpp"
+#include "ofi.hpp"
 #include "registered_memory.hpp"
 #include "socket.h"
 
@@ -35,11 +36,16 @@ class BaseConnection {
 
   virtual void flush(int64_t timeoutUsec = -1) = 0;
 
+  virtual std::unique_ptr<OfiMr const> registerOfiMr(void* data, size_t size) const;
+
   /// Set the local address where remote updateAndSync operations should write.
   /// This is called by the receiver to specify where incoming signals should be written.
   /// Default implementation is a no-op for connections that don't need it.
   /// @param addr The local address for incoming writes.
   virtual void setRemoteUpdateDstAddr(uint64_t /*addr*/) {}
+
+  /// Progress transport-specific background work without blocking.
+  virtual void progress() {}
 
   virtual Transport transport() const = 0;
 
@@ -52,13 +58,16 @@ class BaseConnection {
   int getMaxWriteQueueSize() const;
 
   static std::shared_ptr<BaseConnection>& getImpl(Connection& conn) { return conn.impl_; }
+  static BaseConnection const* getImpl(const Connection& conn) { return conn.impl_.get(); }
 
  protected:
   friend class Context;
   friend class CudaIpcConnection;
   friend class IBConnection;
   friend class EthernetConnection;
+  friend class OfiConnection;
 
+  static Endpoint::Impl& getImpl(Endpoint& endpoint);
   static const Endpoint::Impl& getImpl(const Endpoint& endpoint);
   static const RegisteredMemory::Impl& getImpl(const RegisteredMemory& memory);
   static Context::Impl& getImpl(Context& context);
@@ -159,6 +168,37 @@ class EthernetConnection : public BaseConnection {
   void updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint64_t* src, uint64_t newValue) override;
 
   void flush(int64_t timeoutUsec) override;
+};
+
+class OfiConnection : public BaseConnection {
+ public:
+  OfiConnection(std::shared_ptr<Context> context, const Endpoint& localEndpoint, const Endpoint& remoteEndpoint);
+
+  ~OfiConnection();
+
+  Transport transport() const override;
+
+  Transport remoteTransport() const override;
+
+  void write(RegisteredMemory dst, uint64_t dstOffset, RegisteredMemory src, uint64_t srcOffset,
+             uint64_t size) override;
+
+  void updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint64_t* src, uint64_t newValue) override;
+
+  void flush(int64_t timeoutUsec) override;
+
+  std::unique_ptr<OfiMr const> registerOfiMr(void* data, size_t size) const override;
+
+  void setRemoteUpdateDstAddr(uint64_t addr) override;
+
+  void progress() override;
+
+ private:
+  struct Impl;
+  bool progressInboundSignalsOnce();
+  bool progressCompletionsOnce();
+  void waitForCompletions(int64_t timeoutUsec, void* targetContext, bool drainAll);
+  std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace mscclpp
