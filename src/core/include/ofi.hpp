@@ -84,27 +84,6 @@ class OfiEndpointResources {
   bool supportsWriteData_ = false;
 };
 
-
-//class OfiMr {
-// public:
-//  OfiMr(fid_domain* domain, void* data, size_t size);
-//  ~OfiMr() { close(); }
-//
-//  OfiMr(OfiMr const&) = delete;
-//  OfiMr& operator=(OfiMr const&) = delete;
-//  OfiMr(OfiMr&&) = delete;
-//  OfiMr& operator=(OfiMr&&) = delete;
-//
-//  fid_mr* mr() const { return mr_; }
-//  void* desc() const;
-//  OfiMrInfo const& getInfo() const { return info_; }
-//
-// private:
-//  void close() noexcept;
-//
-//  fid_mr* mr_ = nullptr;
-//  OfiMrInfo info_{};
-//};
 class OfiMr {
  public:
   OfiMr(OfiEndpointResources& epRes, void* data, size_t size, OfiMemoryAttr const& memAttr);
@@ -141,8 +120,6 @@ class OfiCtx {
   fid_domain* domain() const { return domain_; }
   uint64_t mrMode() const { return mrMode_; }
   uint64_t caps() const { return caps_; }
-
-  //std::unique_ptr<const OfiMr> registerMr(void* data, size_t size) const;
 
  private:
   void closeAll() noexcept;
