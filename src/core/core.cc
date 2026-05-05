@@ -87,11 +87,11 @@ const TransportFlags NoTransports = TransportFlags();
 const TransportFlags AllIBTransports = Transport::IB0 | Transport::IB1 | Transport::IB2 | Transport::IB3 |
                                        Transport::IB4 | Transport::IB5 | Transport::IB6 | Transport::IB7;
 
-const TransportFlags AllTransports = AllIBTransports | Transport::CudaIpc | Transport::Ethernet;
+const TransportFlags AllTransports = AllIBTransports | Transport::CudaIpc | Transport::Ethernet | Transport::Ofi;
 
 std::ostream& operator<<(std::ostream& os, const Transport& transport) {
   static const std::string TransportNames[] = {"UNK", "IPC", "IB0", "IB1", "IB2", "IB3",
-                                               "IB4", "IB5", "IB6", "IB7", "ETH", "NUM"};
+                                               "IB4", "IB5", "IB6", "IB7", "ETH", "OFI", "NUM"};
   os << TransportNames[static_cast<size_t>(transport)];
   return os;
 }

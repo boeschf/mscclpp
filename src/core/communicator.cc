@@ -5,6 +5,8 @@
 
 #include "api.h"
 
+#include "debug.h"
+
 namespace mscclpp {
 
 Communicator::Impl::Impl(std::shared_ptr<Bootstrap> bootstrap, std::shared_ptr<Context> context)
@@ -45,6 +47,10 @@ MSCCLPP_API_CPP RegisteredMemory Communicator::registerMemory(void* ptr, size_t 
   return context()->registerMemory(ptr, size, transports);
 }
 
+MSCCLPP_API_CPP RegisteredMemory Communicator::registerMemory(void* ptr, size_t size, TransportFlags transports, const Connection& connection) {
+  return context()->registerMemory(ptr, size, transports, connection);
+}
+
 MSCCLPP_API_CPP void Communicator::sendMemory(RegisteredMemory memory, int remoteRank, int tag) {
   if (remoteRank == bootstrap()->getRank()) {
     // Sending memory to self
@@ -63,6 +69,18 @@ MSCCLPP_API_CPP void Communicator::sendMemory(RegisteredMemory memory, int remot
     return;
   }
   bootstrap()->send(memory.serialize(), remoteRank, tag);
+}
+
+MSCCLPP_API_CPP void Communicator::sendMemory2(const RegisteredMemory& memory, int tag) {
+  if (!memory.hasConnection()) {
+    throw Error("sendMemory(memory) requires a connection-bound RegisteredMemory", ErrorCode::InvalidUsage);
+  }
+  auto it = pimpl_->connectionInfos_.find(memory.connection().impl_.get());
+  if (it == pimpl_->connectionInfos_.end()) {
+    throw Error("sendMemory2 requires a Connection created by this Communicator", ErrorCode::InvalidUsage);
+  }
+  int remoteRank = it->second.remoteRank;
+  sendMemory(memory, remoteRank, tag);
 }
 
 MSCCLPP_API_CPP std::shared_future<RegisteredMemory> Communicator::recvMemory(int remoteRank, int tag) {
@@ -98,10 +116,23 @@ MSCCLPP_API_CPP std::shared_future<RegisteredMemory> Communicator::recvMemory(in
   return shared_future;
 }
 
+MSCCLPP_API_CPP std::shared_future<RegisteredMemory> Communicator::recvMemory2(const Connection& connection, int tag) {
+  if (!connection.impl_) {
+    throw Error("recvMemory(connection) requires a valid Connection", ErrorCode::InvalidUsage);
+  }
+  auto it = pimpl_->connectionInfos_.find(connection.impl_.get());
+  if (it == pimpl_->connectionInfos_.end()) {
+    throw Error("recvMemory2 requires a Connection created by this Communicator", ErrorCode::InvalidUsage);
+  }
+  int remoteRank = it->second.remoteRank;
+  return recvMemory(remoteRank, tag);
+}
+
 MSCCLPP_API_CPP std::shared_future<Connection> Communicator::connect(const Endpoint& localEndpoint, int remoteRank,
                                                                      int tag) {
   if (remoteRank == bootstrap()->getRank()) {
     // Connection to self
+    INFO(MSCCLPP_NET, "Connecting tself");
     auto remoteEndpoint = context()->createEndpoint(localEndpoint.config());
     auto connection = context()->connect(localEndpoint, remoteEndpoint);
     std::promise<Connection> promise;
@@ -110,6 +141,7 @@ MSCCLPP_API_CPP std::shared_future<Connection> Communicator::connect(const Endpo
     return std::shared_future<Connection>(promise.get_future());
   }
 
+  INFO(MSCCLPP_NET, "Connecting to remote rank %d with tag %d", remoteRank, tag);
   bootstrap()->send(localEndpoint.serialize(), remoteRank, tag);
 
   auto future = std::async(std::launch::deferred, [this, remoteRank, tag, localEndpoint,
@@ -132,14 +164,19 @@ MSCCLPP_API_CPP std::shared_future<Connection> Communicator::connect(const Endpo
 
 MSCCLPP_API_CPP std::shared_future<Connection> Communicator::connect(const EndpointConfig& localConfig, int remoteRank,
                                                                      int tag) {
+  INFO(MSCCLPP_NET, "Connecting to remote rank %d with tag %d using local config", remoteRank, tag);
   auto localEndpoint = context()->createEndpoint(localConfig);
+  INFO(MSCCLPP_NET, "Created local endpoint with transport %d", static_cast<int>(localEndpoint.transport()));
   return connect(localEndpoint, remoteRank, tag);
 }
 
 MSCCLPP_API_CPP std::shared_future<Semaphore> Communicator::buildSemaphore(const Connection& connection, int remoteRank,
                                                                            int tag) {
+  INFO(MSCCLPP_NET, "Communicator::buildSemaphore remoteRank=%d tag=%d", remoteRank, tag);
   SemaphoreStub localStub(connection);
+  INFO(MSCCLPP_NET, "Communicator::buildSemaphore local stub created");
   bootstrap()->send(localStub.serialize(), remoteRank, tag);
+  INFO(MSCCLPP_NET, "Communicator::buildSemaphore local stub sent remoteRank=%d tag=%d", remoteRank, tag);
 
   auto future =
       std::async(std::launch::deferred, [this, remoteRank, tag, lastRecvItem = pimpl_->getLastRecvItem(remoteRank, tag),
@@ -158,12 +195,28 @@ MSCCLPP_API_CPP std::shared_future<Semaphore> Communicator::buildSemaphore(const
   return shared_future;
 }
 
+MSCCLPP_API_CPP std::shared_future<Semaphore> Communicator::buildSemaphore2(const Connection& connection, int tag) {
+  auto it = pimpl_->connectionInfos_.find(connection.impl_.get());
+  if (it == pimpl_->connectionInfos_.end()) {
+    throw Error("buildSemaphore2 requires a Connection created by this Communicator", ErrorCode::InvalidUsage);
+  }
+  return buildSemaphore(connection, it->second.remoteRank, tag);
+}
+
 MSCCLPP_API_CPP int Communicator::remoteRankOf(const Connection& connection) {
-  return pimpl_->connectionInfos_.at(connection.impl_.get()).remoteRank;
+  auto it = pimpl_->connectionInfos_.find(connection.impl_.get());
+  if (it == pimpl_->connectionInfos_.end()) {
+    throw Error("remoteRankOf requires a Connection created by this Communicator", ErrorCode::InvalidUsage);
+  }
+  return it->second.remoteRank;
 }
 
 MSCCLPP_API_CPP int Communicator::tagOf(const Connection& connection) {
-  return pimpl_->connectionInfos_.at(connection.impl_.get()).tag;
+  auto it = pimpl_->connectionInfos_.find(connection.impl_.get());
+  if (it == pimpl_->connectionInfos_.end()) {
+    throw Error("tagOf requires a Connection created by this Communicator", ErrorCode::InvalidUsage);
+  }
+  return it->second.tag;
 }
 
 }  // namespace mscclpp

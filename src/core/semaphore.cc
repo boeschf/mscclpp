@@ -8,6 +8,7 @@
 #include "atomic.hpp"
 #include "connection.hpp"
 #include "context.hpp"
+#include "logger.hpp"
 #include "registered_memory.hpp"
 #include "serialization.hpp"
 
@@ -45,6 +46,7 @@ SemaphoreStub::Impl::Impl(const Connection& connection) : connection_(connection
   // Allocate a semaphore ID on the local device
   const Device& localDevice = connection_.localDevice();
   if (localDevice.type == DeviceType::CPU) {
+    WARN(NET, "SemaphoreStub token allocated on CPU memory; local device is CPU");
     token_ = std::make_shared<uint64_t>(0);
   } else if (localDevice.type == DeviceType::GPU) {
     if (localDevice.id < 0) {
@@ -55,7 +57,10 @@ SemaphoreStub::Impl::Impl(const Connection& connection) : connection_(connection
   } else {
     throw Error("Unsupported local device type", ErrorCode::InvalidUsage);
   }
-  idMemory_ = std::move(connection_.context()->registerMemory(token_.get(), sizeof(uint64_t), connection_.transport()));
+  DEBUG(NET, "SemaphoreStub registering token memory transport=", connection_.transport());
+  //idMemory_ = std::move(connection_.context()->registerMemory(token_.get(), sizeof(uint64_t), connection_.transport()));
+  idMemory_ = std::move(
+    connection_.context()->registerMemory(token_.get(), sizeof(uint64_t), connection_.transport(), connection_));
 }
 
 SemaphoreStub::Impl::Impl(const RegisteredMemory& idMemory, const Device& device)
