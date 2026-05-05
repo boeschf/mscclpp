@@ -21,7 +21,8 @@ namespace {
 
 constexpr std::uint32_t kOfiEndpointFlagWriteData = 1u << 0;
 
-constexpr uint64_t kOfiBindFlagsCq = FI_TRANSMIT | FI_RECV | FI_SELECTIVE_COMPLETION;
+constexpr uint64_t kOfiBindFlagsTxCq = FI_TRANSMIT | FI_SELECTIVE_COMPLETION;
+constexpr uint64_t kOfiBindFlagsRxCq = FI_RECV;
 constexpr uint64_t kOfiBindFlagsCntr = FI_WRITE | FI_TRANSMIT;
 
 [[noreturn]] void throwOfiError(char const* what, int rc) {
@@ -35,7 +36,9 @@ void checkOfi(int rc, char const* what) {
 }
 
 void logOfiEndpointConfigOnce(fi_info const* baseInfo, fi_info const* epInfo, size_t queueSize,
-                              size_t cqSize, uint64_t cqBindFlags, uint64_t cntrBindFlags) {
+                              size_t txCqSize, size_t rxCqSize,
+                              uint64_t txCqBindFlags, uint64_t rxCqBindFlags,
+                              uint64_t cntrBindFlags) {
   static std::once_flag once;
   std::call_once(once, [&]() {
     INFO(NET,
@@ -46,8 +49,10 @@ void logOfiEndpointConfigOnce(fi_info const* baseInfo, fi_info const* epInfo, si
          " ep rx_attr.size=", epInfo->rx_attr ? epInfo->rx_attr->size : 0,
          " ep tx_attr.op_flags=", epInfo->tx_attr ? static_cast<unsigned long long>(epInfo->tx_attr->op_flags) : 0ull,
          " qsz=", queueSize,
-         " cq.size=", cqSize,
-         " cq_bind_flags=", static_cast<unsigned long long>(cqBindFlags),
+         " tx_cq.size=", txCqSize,
+         " rx_cq.size=", rxCqSize,
+         " tx_cq_bind_flags=", static_cast<unsigned long long>(txCqBindFlags),
+         " rx_cq_bind_flags=", static_cast<unsigned long long>(rxCqBindFlags),
          " cntr_bind_flags=", static_cast<unsigned long long>(cntrBindFlags));
   });
 }
@@ -323,18 +328,27 @@ OfiEndpointResources::OfiEndpointResources(OfiCtx& ctx, EndpointConfig const& co
     DEBUG(NET, "OfiEndpointResources: AV created for provider ", ctx.info()->fabric_attr->prov_name,
           " domain=", ctx.info()->domain_attr->name);
 
-    fi_cq_attr cqAttr = {};
-    cqAttr.format = FI_CQ_FORMAT_CONTEXT;
-    //cqAttr.format = FI_CQ_FORMAT_MSG;
-    cqAttr.wait_obj = FI_WAIT_NONE;
-    //cqAttr.size = (config.maxWriteQueueSize > 0) ? static_cast<size_t>(config.maxWriteQueueSize) : 1024;
-    cqAttr.size = std::max<size_t>(qsz, epInfo->tx_attr->size + epInfo->rx_attr->size);
+    fi_cq_attr txCqAttr = {};
+    txCqAttr.format = FI_CQ_FORMAT_CONTEXT;
+    txCqAttr.wait_obj = FI_WAIT_NONE;
+    txCqAttr.size = std::max<size_t>(qsz, epInfo->tx_attr->size);
 
-    logOfiEndpointConfigOnce(ctx.info(), epInfo, qsz, cqAttr.size, kOfiBindFlagsCq, kOfiBindFlagsCntr);
+    fi_cq_attr rxCqAttr = {};
+    rxCqAttr.format = FI_CQ_FORMAT_DATA;
+    rxCqAttr.wait_obj = FI_WAIT_NONE;
+    rxCqAttr.size = std::max<size_t>(qsz, epInfo->rx_attr->size);
 
-    rc = fi_cq_open(ctx.domain(), &cqAttr, &cq_, nullptr);
-    checkOfi(rc, "fi_cq_open");
-    DEBUG(NET, "OfiEndpointResources: CQ created for provider ", ctx.info()->fabric_attr->prov_name,
+    logOfiEndpointConfigOnce(ctx.info(), epInfo, qsz, txCqAttr.size, rxCqAttr.size,
+                             kOfiBindFlagsTxCq, kOfiBindFlagsRxCq, kOfiBindFlagsCntr);
+
+    rc = fi_cq_open(ctx.domain(), &txCqAttr, &txCq_, nullptr);
+    checkOfi(rc, "fi_cq_open(tx)");
+    DEBUG(NET, "OfiEndpointResources: TX CQ created for provider ", ctx.info()->fabric_attr->prov_name,
+          " domain=", ctx.info()->domain_attr->name);
+
+    rc = fi_cq_open(ctx.domain(), &rxCqAttr, &rxCq_, nullptr);
+    checkOfi(rc, "fi_cq_open(rx)");
+    DEBUG(NET, "OfiEndpointResources: RX CQ created for provider ", ctx.info()->fabric_attr->prov_name,
           " domain=", ctx.info()->domain_attr->name);
 
     fi_cntr_attr cntrAttr = {};
@@ -358,11 +372,15 @@ OfiEndpointResources::OfiEndpointResources(OfiCtx& ctx, EndpointConfig const& co
 
     //rc = fi_ep_bind(ep_, &cq_->fid, FI_TRANSMIT | FI_RECV);
     //rc = fi_ep_bind(ep_, &cq_->fid, FI_TRANSMIT | FI_RECV | FI_SELECTIVE_COMPLETION);
-    rc = fi_ep_bind(ep_, &cq_->fid, kOfiBindFlagsCq);
-    //rc = fi_ep_bind(ep_, &cq_->fid, FI_TRANSMIT);
-    checkOfi(rc, "fi_ep_bind(CQ)");
-    DEBUG(NET, "OfiEndpointResources: EP bound to CQ for provider ", ctx.info()->fabric_attr->prov_name,
-          " domain=", ctx.info()->domain_attr->name, " flags=", static_cast<unsigned long long>(kOfiBindFlagsCq));
+    rc = fi_ep_bind(ep_, &txCq_->fid, kOfiBindFlagsTxCq);
+    checkOfi(rc, "fi_ep_bind(TX_CQ)");
+    DEBUG(NET, "OfiEndpointResources: EP bound to TX CQ for provider ", ctx.info()->fabric_attr->prov_name,
+          " domain=", ctx.info()->domain_attr->name, " flags=", static_cast<unsigned long long>(kOfiBindFlagsTxCq));
+
+    rc = fi_ep_bind(ep_, &rxCq_->fid, kOfiBindFlagsRxCq);
+    checkOfi(rc, "fi_ep_bind(RX_CQ)");
+    DEBUG(NET, "OfiEndpointResources: EP bound to RX CQ for provider ", ctx.info()->fabric_attr->prov_name,
+          " domain=", ctx.info()->domain_attr->name, " flags=", static_cast<unsigned long long>(kOfiBindFlagsRxCq));
 
     rc = fi_ep_bind(ep_, &txCntr_->fid, kOfiBindFlagsCntr);
     checkOfi(rc, "fi_ep_bind(CNTR)");
@@ -378,10 +396,16 @@ OfiEndpointResources::OfiEndpointResources(OfiCtx& ctx, EndpointConfig const& co
     DEBUG(NET, "OfiEndpointResources: address cached for provider ", ctx.info()->fabric_attr->prov_name,
           " domain=", ctx.info()->domain_attr->name, " addr_bytes=", addr_.size());
 
-    supportsWriteData_ = false;
+    supportsWriteData_ =
+        (ctx.info()->domain_attr != nullptr) &&
+        (ctx.info()->domain_attr->cq_data_size > 0) &&
+        ((ctx.mrMode() & FI_MR_PROV_KEY) != 0);
     if (supportsWriteData_) {
       flags_ |= kOfiEndpointFlagWriteData;
     }
+    INFO(NET, "OfiEndpointResources: supportsWriteData=", supportsWriteData_,
+         " cq_data_size=", ctx.info()->domain_attr ? ctx.info()->domain_attr->cq_data_size : 0,
+         " mr_mode=", ctx.mrMode());
     //{
     //  size_t injectRmaSize = 0;
     //  size_t optlen = sizeof(injectRmaSize);
@@ -429,9 +453,13 @@ void OfiEndpointResources::closeAll() noexcept {
     fi_close(&txCntr_->fid);
     txCntr_ = nullptr;
   }
-  if (cq_ != nullptr) {
-    fi_close(&cq_->fid);
-    cq_ = nullptr;
+  if (rxCq_ != nullptr) {
+    fi_close(&rxCq_->fid);
+    rxCq_ = nullptr;
+  }
+  if (txCq_ != nullptr) {
+    fi_close(&txCq_->fid);
+    txCq_ = nullptr;
   }
   if (av_ != nullptr) {
     fi_close(&av_->fid);

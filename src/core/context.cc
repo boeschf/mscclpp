@@ -12,7 +12,6 @@
 #include "endpoint.hpp"
 #include "registered_memory.hpp"
 
-#include <iostream>
 namespace mscclpp {
 
 CudaIpcStream::CudaIpcStream(int deviceId)
@@ -91,15 +90,15 @@ std::unique_ptr<OfiEndpointResources> Context::Impl::createOfiEndpointResources(
   if (!hasOfiConfig_) {
     throw Error("No OFI configuration is bound to this Context", ErrorCode::InvalidUsage);
   }
-  std::cout << "    Context::Impl::createOfiEndpointResources with provider " << ofiConfig_.provider
-            << " and domain " << ofiConfig_.domain << std::endl;
+  INFO(MSCCLPP_NET, "Context::Impl::createOfiEndpointResources provider=%s domain=%s",
+       ofiConfig_.provider.c_str(), ofiConfig_.domain.c_str());
   if (!ofiCtx_) {
-    std::cout << "    Creating OfiCtx for Context with provider " << ofiConfig_.provider << " and domain " << ofiConfig_.domain
-              << std::endl;
+    INFO(MSCCLPP_NET, "Creating OfiCtx for Context provider=%s domain=%s",
+         ofiConfig_.provider.c_str(), ofiConfig_.domain.c_str());
     ofiCtx_ = std::make_unique<OfiCtx>(ofiConfig_);
   }
-  std::cout << "    Returning OfiEndpointResources for Context with provider " << ofiConfig_.provider << " and domain " << ofiConfig_.domain
-            << std::endl;
+  INFO(MSCCLPP_NET, "Returning OfiEndpointResources for Context provider=%s domain=%s",
+       ofiConfig_.provider.c_str(), ofiConfig_.domain.c_str());
   return std::make_unique<OfiEndpointResources>(*ofiCtx_, config);
 }
 
@@ -124,7 +123,7 @@ MSCCLPP_API_CPP RegisteredMemory Context::registerMemory(void* ptr, size_t size,
 }
 
 MSCCLPP_API_CPP Endpoint Context::createEndpoint(EndpointConfig config) {
-    std::cout << "Context::createEndpoint with transport " << config.transport << std::endl;
+  INFO(MSCCLPP_NET, "Context::createEndpoint transport=%d", static_cast<int>(config.transport));
   return Endpoint(std::make_shared<Endpoint::Impl>(config, *pimpl_));
 }
 

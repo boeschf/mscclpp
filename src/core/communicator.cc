@@ -6,7 +6,6 @@
 #include "api.h"
 
 #include "debug.h"
-#include <iostream>
 
 namespace mscclpp {
 
@@ -157,21 +156,19 @@ MSCCLPP_API_CPP std::shared_future<Connection> Communicator::connect(const Endpo
 
 MSCCLPP_API_CPP std::shared_future<Connection> Communicator::connect(const EndpointConfig& localConfig, int remoteRank,
                                                                      int tag) {
-    std::cout << "Communicator::connect with localConfig" << std::endl;
   INFO(MSCCLPP_NET, "Connecting to remote rank %d with tag %d using local config", remoteRank, tag);
   auto localEndpoint = context()->createEndpoint(localConfig);
-  std::cout << "Created local endpoint with transport " << static_cast<int>(localEndpoint.transport()) << std::endl;
+  INFO(MSCCLPP_NET, "Created local endpoint with transport %d", static_cast<int>(localEndpoint.transport()));
   return connect(localEndpoint, remoteRank, tag);
 }
 
 MSCCLPP_API_CPP std::shared_future<Semaphore> Communicator::buildSemaphore(const Connection& connection, int remoteRank,
                                                                            int tag) {
-  std::cout << "Communicator::buildSemaphore: Building semaphore for remote rank " << remoteRank << " with tag " << tag
-            << std::endl;
+  INFO(MSCCLPP_NET, "Communicator::buildSemaphore remoteRank=%d tag=%d", remoteRank, tag);
   SemaphoreStub localStub(connection);
-  std::cout << "Communicator::buildSemaphore: localStub created" << std::endl;
+  INFO(MSCCLPP_NET, "Communicator::buildSemaphore local stub created");
   bootstrap()->send(localStub.serialize(), remoteRank, tag);
-  std::cout << "Communicator::buildSemaphore: localStub sent to remote rank " << remoteRank << " with tag " << tag << std::endl;
+  INFO(MSCCLPP_NET, "Communicator::buildSemaphore local stub sent remoteRank=%d tag=%d", remoteRank, tag);
 
   auto future =
       std::async(std::launch::deferred, [this, remoteRank, tag, lastRecvItem = pimpl_->getLastRecvItem(remoteRank, tag),

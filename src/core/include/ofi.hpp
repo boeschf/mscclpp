@@ -60,7 +60,8 @@ class OfiEndpointResources {
   OfiCtx& ctx() const { return *ctx_; }
   fid_ep* ep() const { return ep_; }
   fid_av* av() const { return av_; }
-  fid_cq* cq() const { return cq_; }
+  fid_cq* txCq() const { return txCq_; }
+  fid_cq* rxCq() const { return rxCq_; }
   fid_cntr* txCntr() const { return txCntr_; }
 
   std::vector<uint8_t> const& address() const { return addr_; }
@@ -74,7 +75,8 @@ class OfiEndpointResources {
   OfiCtx* ctx_ = nullptr;
   fid_ep* ep_ = nullptr;
   fid_av* av_ = nullptr;
-  fid_cq* cq_ = nullptr;
+  fid_cq* txCq_ = nullptr;
+  fid_cq* rxCq_ = nullptr;
   fid_cntr* txCntr_ = nullptr;
 
   std::vector<uint8_t> addr_;

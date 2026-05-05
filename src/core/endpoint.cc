@@ -16,8 +16,6 @@
 #include "socket.h"
 #include "utils_internal.hpp"
 
-#include <iostream>
-
 namespace mscclpp {
 
 Endpoint::Impl::Impl(const EndpointConfig& config, Context::Impl& contextImpl)
@@ -67,8 +65,6 @@ Endpoint::Impl::Impl(const EndpointConfig& config, Context::Impl& contextImpl)
     socket_->bindAndListen();
     socketAddress_ = socket_->getAddr();
   } else if (config_.transport == Transport::Ofi) {
-      std::cout << "Creating OFI endpoint with provider " << config_.ofi.provider << " and domain " << config_.ofi.domain
-                << std::endl;
 #if defined(MSCCLPP_USE_OFI)
       if (config_.ofi.provider.empty()) config_.ofi.provider = env()->ofiProvider;
       if (config_.ofi.domain.empty()) config_.ofi.domain = env()->ofiDomain;
@@ -76,18 +72,15 @@ Endpoint::Impl::Impl(const EndpointConfig& config, Context::Impl& contextImpl)
         // domain =  cxiX, where X=config_.device.id
         config_.ofi.domain = "cxi" + std::to_string(config_.device.id);
       }
-      std::cout << "  Using OFI provider " << config_.ofi.provider << " and domain " << config_.ofi.domain << std::endl;
+      INFO(NET, "Endpoint OFI config: provider=", config_.ofi.provider, " domain=", config_.ofi.domain);
       contextImpl.bindOfiConfig(config_.ofi);
       if (config_.maxWriteQueueSize <= 0) {
         config_.maxWriteQueueSize = 1024;
       }
-      std::cout << "  Creating resources for OFI endpoint with transport " << config_.transport << std::endl;
       ofiResources_ = contextImpl.createOfiEndpointResources(config_);
-      std::cout << "  OFI endpoint resources created" << std::endl;
       ofiWireInfo_.flags = ofiResources_->flags();
       ofiWireInfo_.addr = ofiResources_->address();
-      std::cout << "  OFI endpoint created with flags " << ofiWireInfo_.flags
-                << std::endl;
+      INFO(NET, "Endpoint OFI wire info: flags=", ofiWireInfo_.flags, " addr_bytes=", ofiWireInfo_.addr.size());
 #else
       throw Error("OFI transport is not supported in this build", ErrorCode::InvalidUsage);
 #endif

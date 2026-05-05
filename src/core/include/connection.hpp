@@ -44,6 +44,9 @@ class BaseConnection {
   /// @param addr The local address for incoming writes.
   virtual void setRemoteUpdateDstAddr(uint64_t /*addr*/) {}
 
+  /// Progress transport-specific background work without blocking.
+  virtual void progress() {}
+
   virtual Transport transport() const = 0;
 
   virtual Transport remoteTransport() const = 0;
@@ -186,8 +189,13 @@ class OfiConnection : public BaseConnection {
 
   std::unique_ptr<OfiMr const> registerOfiMr(void* data, size_t size) const override;
 
+  void setRemoteUpdateDstAddr(uint64_t addr) override;
+
+  void progress() override;
+
  private:
   struct Impl;
+  bool progressInboundSignalsOnce();
   bool progressCompletionsOnce();
   void waitForCompletions(int64_t timeoutUsec, void* targetContext, bool drainAll);
   std::unique_ptr<Impl> impl_;
