@@ -817,7 +817,8 @@ OfiConnection::OfiConnection(std::shared_ptr<Context> context, Endpoint const& l
 
   const bool localWriteData = localResources->supportsWriteData();
   const bool remoteWriteData = (remoteImpl.ofiWireInfo_.flags & kOfiEndpointFlagWriteData) != 0;
-  impl_->useWriteDataSignal = localWriteData && remoteWriteData;
+  const bool cxiWriteDataEnabled = envEnabled("FI_CXI_ENABLE_WRITEDATA");
+  impl_->useWriteDataSignal = localWriteData && remoteWriteData && cxiWriteDataEnabled;
   impl_->preferInjectWriteData = envEnabled("MSCCLPP_OFI_INJECT_WRITEDATA");
 
   impl_->updateScratch = std::make_unique<uint64_t>(0);
@@ -830,6 +831,9 @@ OfiConnection::OfiConnection(std::shared_ptr<Context> context, Endpoint const& l
   INFO(CONN, "OfiConnection created: local EP ", impl_->resources->ep(),
        ", peerAddr=", static_cast<uint64_t>(impl_->peerAddr),
        ", remoteAddrBytes=", remoteImpl.ofiWireInfo_.addr.size(),
+       ", localWriteData=", localWriteData,
+       ", remoteWriteData=", remoteWriteData,
+       ", cxiWriteDataEnabled=", cxiWriteDataEnabled,
        ", useWriteDataSignal=", impl_->useWriteDataSignal,
        ", preferInjectWriteData=", impl_->preferInjectWriteData);
 
