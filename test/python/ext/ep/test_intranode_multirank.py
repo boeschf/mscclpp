@@ -41,7 +41,7 @@ def init_dist():
     torch.cuda.set_device(local_rank)
     dist.init_process_group(
         backend="nccl",
-        init_method=f"tcp://{os.environ.get('MASTER_ADDR','127.0.0.1')}:{os.environ.get('MASTER_PORT','29500')}",
+        init_method=f"tcp://{os.environ.get('MASTER_ADDR', '127.0.0.1')}:{os.environ.get('MASTER_PORT', '29500')}",
         world_size=world_size,
         rank=rank,
     )
@@ -76,9 +76,14 @@ def main():
     torch.manual_seed(0xA1B2 + rank)
 
     # Build topk layout that maps each token to num_topk distinct ranks/experts
-    scores = torch.randn((num_tokens, num_experts), device="cuda", dtype=torch.float32).abs() + 1
+    scores = (
+        torch.randn((num_tokens, num_experts), device="cuda", dtype=torch.float32).abs()
+        + 1
+    )
     topk_idx = torch.topk(scores, num_topk, dim=-1, sorted=False).indices
-    topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device="cuda")
+    topk_weights = torch.ones(
+        (num_tokens, num_topk), dtype=torch.float32, device="cuda"
+    )
 
     rank_idx = topk_idx // (num_experts // num_ranks)
     rank_idx.masked_fill_(topk_idx == -1, -1)
@@ -90,26 +95,35 @@ def main():
         num_tokens_per_expert[i] = (topk_idx == i).sum()
 
     num_tokens_per_rank = torch.empty((num_ranks,), dtype=torch.int, device="cuda")
-    token_idx_in_rank = torch.full((num_ranks, num_tokens), -1, dtype=torch.long, device="cuda")
+    token_idx_in_rank = torch.full(
+        (num_ranks, num_tokens), -1, dtype=torch.long, device="cuda"
+    )
     for i in range(num_ranks):
         num_tokens_per_rank[i] = (rank_idx == i).sum()
         token_sel = (rank_idx == i).max(dim=-1).values
         cnt = token_sel.sum().item()
         tokens = torch.sort(token_sel.to(torch.int), descending=True).indices
         tokens[:cnt] = torch.sort(tokens[:cnt]).values
-        token_idx_in_rank[i][tokens[:cnt]] = torch.arange(cnt, dtype=torch.long, device="cuda")
+        token_idx_in_rank[i][tokens[:cnt]] = torch.arange(
+            cnt, dtype=torch.long, device="cuda"
+        )
     token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
     is_token_in_rank = token_idx_in_rank >= 0
 
     # Token payload = rank id (cast to bf16) so we can check correctness
-    x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device="cuda") * float(rank)
+    x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device="cuda") * float(
+        rank
+    )
 
     # Allocate Buffer (intranode only: num_rdma_bytes=0). Size the NVL buffer
     # using max(hidden, bench_hidden) so the optional bench phase fits.
     cfg = ep.Config(20, 8, 256)
     _bench_on = os.environ.get("MSCCLPP_EP_BENCH", "0") == "1"
-    _buf_hidden = max(hidden, int(os.environ.get("MSCCLPP_EP_BENCH_HIDDEN", "0"))) if _bench_on else hidden
-    num_nvl_bytes = cfg.get_nvl_buffer_size_hint(_buf_hidden * x.element_size(), num_ranks)
+    _bench_hidden_cfg = int(os.environ.get("MSCCLPP_EP_BENCH_HIDDEN", "7168"))
+    _buf_hidden = max(hidden, _bench_hidden_cfg) if _bench_on else hidden
+    num_nvl_bytes = cfg.get_nvl_buffer_size_hint(
+        _buf_hidden * x.element_size(), num_ranks
+    )
     if rank == 0:
         print(
             f"[cfg] num_ranks={num_ranks} num_tokens={num_tokens} hidden={hidden} "
@@ -118,12 +132,16 @@ def main():
         )
 
     print(f"[rank {rank}] creating Buffer", flush=True)
-    buf = ep.Buffer(group, num_nvl_bytes=num_nvl_bytes, num_rdma_bytes=0, low_latency_mode=False)
+    buf = ep.Buffer(
+        group, num_nvl_bytes=num_nvl_bytes, num_rdma_bytes=0, low_latency_mode=False
+    )
     print(f"[rank {rank}] Buffer created is_available={buf.is_available()}", flush=True)
     assert buf.is_available()
 
     # get_dispatch_layout sanity
-    ref_rank, _, ref_exp, ref_in_rank, _ = buf.runtime.get_dispatch_layout(topk_idx, num_experts, None, False, False)
+    ref_rank, _, ref_exp, ref_in_rank, _ = buf.runtime.get_dispatch_layout(
+        topk_idx, num_experts, None, False, False
+    )
     assert torch.allclose(ref_rank, num_tokens_per_rank)
     assert torch.allclose(ref_exp, num_tokens_per_expert)
     assert torch.allclose(ref_in_rank, is_token_in_rank)
@@ -171,7 +189,9 @@ def main():
         block = recv_x[start:end]
         if block.numel():
             actual = block.float().amin().item()
-            assert abs(actual - src) < 1e-3, f"rank{rank}: block from src={src} has min={actual}, expected {src}"
+            assert abs(actual - src) < 1e-3, (
+                f"rank{rank}: block from src={src} has min={actual}, expected {src}"
+            )
             assert abs(block.float().amax().item() - src) < 1e-3
         start = end
     if rank == 0:
@@ -207,7 +227,10 @@ def main():
     diff = (got - expected).abs().max().item()
     max_exp = expected.abs().max().item()
     if rank == 0:
-        print(f"[combine] max|got-expected|={diff:.4e} max|expected|={max_exp:.4e}", flush=True)
+        print(
+            f"[combine] max|got-expected|={diff:.4e} max|expected|={max_exp:.4e}",
+            flush=True,
+        )
     assert diff < 1e-2, f"rank{rank}: combine mismatch max diff {diff}"
 
     dist.barrier(group=group)
@@ -223,22 +246,31 @@ def main():
     warmup = int(os.environ.get("MSCCLPP_EP_BENCH_WARMUP", "5"))
     iters = int(os.environ.get("MSCCLPP_EP_BENCH_ITERS", "20"))
     bench_tokens = int(os.environ.get("MSCCLPP_EP_BENCH_TOKENS", "4096"))
-    bench_hidden = int(os.environ.get("MSCCLPP_EP_BENCH_HIDDEN", "7168"))
+    bench_hidden = int(
+        os.environ.get("MSCCLPP_EP_BENCH_HIDDEN", str(_bench_hidden_cfg))
+    )
     # Allow overriding num_experts / num_topk for the bench phase to match
     # NCCL-EP's `ep_bench -a ht` defaults (256 experts, top-8). The functional
     # check above still uses the smaller (num_experts=num_ranks*4, topk=4)
     # configuration.
-    bench_num_experts = int(os.environ.get("MSCCLPP_EP_BENCH_EXPERTS", str(num_experts)))
+    bench_num_experts = int(
+        os.environ.get("MSCCLPP_EP_BENCH_EXPERTS", str(num_experts))
+    )
     bench_num_topk = int(os.environ.get("MSCCLPP_EP_BENCH_TOPK", str(num_topk)))
     if bench_num_experts % num_ranks != 0:
         if rank == 0:
             print(
-                f"[bench] skip: num_experts={bench_num_experts} not divisible " f"by num_ranks={num_ranks}", flush=True
+                f"[bench] skip: num_experts={bench_num_experts} not divisible "
+                f"by num_ranks={num_ranks}",
+                flush=True,
             )
         return
     if bench_num_topk > bench_num_experts:
         if rank == 0:
-            print(f"[bench] skip: topk={bench_num_topk} > experts={bench_num_experts}", flush=True)
+            print(
+                f"[bench] skip: topk={bench_num_topk} > experts={bench_num_experts}",
+                flush=True,
+            )
         return
 
     # Rebuild inputs at bench size. Keep same layout recipe as above but at
@@ -254,27 +286,42 @@ def main():
             )
         return
 
-    scores_b = torch.randn((bench_tokens, bench_num_experts), device="cuda", dtype=torch.float32).abs() + 1
+    scores_b = (
+        torch.randn(
+            (bench_tokens, bench_num_experts), device="cuda", dtype=torch.float32
+        ).abs()
+        + 1
+    )
     topk_idx_b = torch.topk(scores_b, bench_num_topk, dim=-1, sorted=False).indices
-    topk_weights_b = torch.ones((bench_tokens, bench_num_topk), dtype=torch.float32, device="cuda")
+    topk_weights_b = torch.ones(
+        (bench_tokens, bench_num_topk), dtype=torch.float32, device="cuda"
+    )
     rank_idx_b = topk_idx_b // (bench_num_experts // num_ranks)
     rank_idx_b.masked_fill_(topk_idx_b == -1, -1)
     inplace_unique(rank_idx_b, num_ranks)
-    num_tokens_per_expert_b = torch.zeros((bench_num_experts,), dtype=torch.int, device="cuda")
+    num_tokens_per_expert_b = torch.zeros(
+        (bench_num_experts,), dtype=torch.int, device="cuda"
+    )
     for i in range(bench_num_experts):
         num_tokens_per_expert_b[i] = (topk_idx_b == i).sum()
     num_tokens_per_rank_b = torch.empty((num_ranks,), dtype=torch.int, device="cuda")
-    token_idx_in_rank_b = torch.full((num_ranks, bench_tokens), -1, dtype=torch.long, device="cuda")
+    token_idx_in_rank_b = torch.full(
+        (num_ranks, bench_tokens), -1, dtype=torch.long, device="cuda"
+    )
     for i in range(num_ranks):
         num_tokens_per_rank_b[i] = (rank_idx_b == i).sum()
         token_sel = (rank_idx_b == i).max(dim=-1).values
         cnt = token_sel.sum().item()
         tokens = torch.sort(token_sel.to(torch.int), descending=True).indices
         tokens[:cnt] = torch.sort(tokens[:cnt]).values
-        token_idx_in_rank_b[i][tokens[:cnt]] = torch.arange(cnt, dtype=torch.long, device="cuda")
+        token_idx_in_rank_b[i][tokens[:cnt]] = torch.arange(
+            cnt, dtype=torch.long, device="cuda"
+        )
     token_idx_in_rank_b = token_idx_in_rank_b.T.contiguous().to(torch.int)
     is_token_in_rank_b = token_idx_in_rank_b >= 0
-    x_b = torch.ones((bench_tokens, bench_hidden), dtype=torch.bfloat16, device="cuda") * float(rank)
+    x_b = torch.ones(
+        (bench_tokens, bench_hidden), dtype=torch.bfloat16, device="cuda"
+    ) * float(rank)
 
     def _dispatch():
         return buf.runtime.intranode_dispatch(
@@ -365,7 +412,12 @@ def main():
 
     # Average per-rank token counts across ranks (matches NCCL-EP `Byte counts (per rank avg)`).
     counts_t = torch.tensor(
-        [total_send_tokens_local, rdma_send_tokens_local, total_recv_tokens_local, rdma_recv_tokens_local],
+        [
+            total_send_tokens_local,
+            rdma_send_tokens_local,
+            total_recv_tokens_local,
+            rdma_recv_tokens_local,
+        ],
         dtype=torch.float64,
         device="cuda",
     )
@@ -406,10 +458,14 @@ def main():
     d_recv_total_bw = total_recv_bytes / disp_t_s / 1e9
     d_recv_nvl_bw = nvl_recv_bytes / disp_t_s / 1e9
     d_recv_rdma_bw = rdma_recv_bytes / disp_t_s / 1e9
-    c_send_total_bw = total_recv_bytes / comb_t_s / 1e9  # combine sends back what dispatch received
+    c_send_total_bw = (
+        total_recv_bytes / comb_t_s / 1e9
+    )  # combine sends back what dispatch received
     c_send_nvl_bw = nvl_recv_bytes / comb_t_s / 1e9
     c_send_rdma_bw = rdma_recv_bytes / comb_t_s / 1e9
-    c_recv_total_bw = total_send_bytes / comb_t_s / 1e9  # combine receives back what dispatch sent
+    c_recv_total_bw = (
+        total_send_bytes / comb_t_s / 1e9
+    )  # combine receives back what dispatch sent
     c_recv_nvl_bw = nvl_send_bytes / comb_t_s / 1e9
     c_recv_rdma_bw = rdma_send_bytes / comb_t_s / 1e9
     if rank == 0:
@@ -443,10 +499,10 @@ def main():
         )
         print(
             f"  byte counts (per rank avg): "
-            f"total_send={total_send_bytes/1e6:.2f} MB ({total_send_avg:.0f} tok)  "
-            f"rdma_send={rdma_send_bytes/1e6:.2f} MB ({rdma_send_avg:.0f} tok)  "
-            f"total_recv={total_recv_bytes/1e6:.2f} MB ({total_recv_avg:.0f} tok)  "
-            f"rdma_recv={rdma_recv_bytes/1e6:.2f} MB ({rdma_recv_avg:.0f} tok)",
+            f"total_send={total_send_bytes / 1e6:.2f} MB ({total_send_avg:.0f} tok)  "
+            f"rdma_send={rdma_send_bytes / 1e6:.2f} MB ({rdma_send_avg:.0f} tok)  "
+            f"total_recv={total_recv_bytes / 1e6:.2f} MB ({total_recv_avg:.0f} tok)  "
+            f"rdma_recv={rdma_recv_bytes / 1e6:.2f} MB ({rdma_recv_avg:.0f} tok)",
             flush=True,
         )
 

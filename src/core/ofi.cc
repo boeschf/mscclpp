@@ -25,6 +25,15 @@ constexpr uint64_t kOfiBindFlagsTxCq = FI_TRANSMIT | FI_SELECTIVE_COMPLETION;
 constexpr uint64_t kOfiBindFlagsRxCq = FI_RECV;
 constexpr uint64_t kOfiBindFlagsCntr = FI_WRITE | FI_TRANSMIT;
 
+#ifdef FI_REMOTE_ATOMIC
+constexpr uint64_t kOfiRemoteAtomicAccess = FI_REMOTE_ATOMIC;
+#else
+constexpr uint64_t kOfiRemoteAtomicAccess = 0;
+#endif
+
+constexpr uint64_t kOfiMrAccess =
+    FI_READ | FI_WRITE | FI_RECV | FI_SEND | FI_ATOMIC | FI_REMOTE_READ | FI_REMOTE_WRITE | kOfiRemoteAtomicAccess;
+
 [[noreturn]] void throwOfiError(char const* what, int rc) {
   THROW(NET, Error, ErrorCode::SystemError, what, " failed: ", fi_strerror(-rc), " (rc=", rc, ")");
 }
@@ -100,7 +109,7 @@ OfiMr::OfiMr(OfiEndpointResources& epRes, void* data, size_t size, OfiMemoryAttr
     attr.mr_iov = &iov;
     attr.iov_count = 1;
     //attr.access = FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE;
-    attr.access = FI_READ | FI_WRITE | FI_RECV | FI_SEND | FI_REMOTE_READ | FI_REMOTE_WRITE;
+    attr.access = kOfiMrAccess;
     attr.offset = 0;
     attr.requested_key = 0;
     attr.context = nullptr;
@@ -138,7 +147,7 @@ OfiMr::OfiMr(OfiEndpointResources& epRes, void* data, size_t size, OfiMemoryAttr
                    data,
                    size,
                    //FI_READ | FI_WRITE | FI_REMOTE_READ | FI_REMOTE_WRITE,
-                   FI_READ | FI_WRITE | FI_RECV | FI_SEND | FI_REMOTE_READ | FI_REMOTE_WRITE,
+                   kOfiMrAccess,
                    0,
                    0,
                    0,
@@ -196,7 +205,7 @@ OfiCtx::OfiCtx(EndpointConfig::Ofi const& config) {
   try {
     hints->domain_attr->mr_mode = FI_MR_ENDPOINT | FI_MR_ALLOCATED | FI_MR_PROV_KEY;
     //hints->caps = FI_MSG | FI_RMA | FI_HMEM | FI_LOCAL_COMM | FI_REMOTE_COMM;
-    hints->caps = FI_RMA | FI_HMEM | FI_LOCAL_COMM | FI_REMOTE_COMM;
+    hints->caps = FI_RMA | FI_ATOMIC | FI_HMEM | FI_LOCAL_COMM | FI_REMOTE_COMM;
     hints->ep_attr->type = FI_EP_RDM;
     //hints->domain_attr->threading = FI_THREAD_DOMAIN;
     hints->domain_attr->threading = FI_THREAD_SAFE;

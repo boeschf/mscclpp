@@ -37,7 +37,11 @@ void CudaIpcStream::atomicAdd(uint64_t* dst, int64_t value) {
     CUresult res = cuDeviceGet(&cuDevice, deviceId_);
     if (res != CUDA_SUCCESS) throw Error("cuDeviceGet failed", ErrorCode::InternalError);
 
+    #if CUDA_VERSION >= 13000
+    res = cuCtxCreate(&proxyAtomicCtx_, nullptr, 0, cuDevice);
+    #else
     res = cuCtxCreate(&proxyAtomicCtx_, 0, cuDevice);
+    #endif
     if (res != CUDA_SUCCESS) throw Error("cuCtxCreate failed", ErrorCode::InternalError);
 
     cuCtxPopCurrent(nullptr);

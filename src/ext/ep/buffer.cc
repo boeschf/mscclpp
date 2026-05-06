@@ -326,24 +326,27 @@ void Buffer::sync(const std::vector<int>& device_ids,
     bootstrap->barrier();
     CUDA_CHECK(cudaDeviceSynchronize());
 
+    const bool ll_ipc_only = low_latency_mode && num_rdma_ranks == 1;
+
     // Rank -> RDMA buffer IDs. MemoryIds are local to each ProxyService;
     // we register every memory in every proxy in the same global order so
     // a single int identifies the memory across all of them.
-    std::map<int, mscclpp::MemoryId> memory_ids;
+    if (!ll_ipc_only) {
+      std::map<int, mscclpp::MemoryId> memory_ids;
 
-    auto add_memory_to_all = [&](mscclpp::RegisteredMemory mem) -> mscclpp::MemoryId {
-      mscclpp::MemoryId id = static_cast<mscclpp::MemoryId>(-1);
-      for (auto& ps : proxy_services) {
-        auto cur = ps->addMemory(mem);
-        if (id == static_cast<mscclpp::MemoryId>(-1)) id = cur;
-        EP_HOST_ASSERT(cur == id && "MemoryIds drifted across proxy services");
-      }
-      return id;
-    };
+      auto add_memory_to_all = [&](mscclpp::RegisteredMemory mem) -> mscclpp::MemoryId {
+        mscclpp::MemoryId id = static_cast<mscclpp::MemoryId>(-1);
+        for (auto& ps : proxy_services) {
+          auto cur = ps->addMemory(mem);
+          if (id == static_cast<mscclpp::MemoryId>(-1)) id = cur;
+          EP_HOST_ASSERT(cur == id && "MemoryIds drifted across proxy services");
+        }
+        return id;
+      };
 
-    // Register local memory
-    auto local_rdma_buffer_mem = communicator->registerMemory(rdma_buffer_ptr, num_rdma_bytes, all_transport);
-    memory_ids[rank] = add_memory_to_all(local_rdma_buffer_mem);
+      // Register local memory
+      auto local_rdma_buffer_mem = communicator->registerMemory(rdma_buffer_ptr, num_rdma_bytes, all_transport);
+      memory_ids[rank] = add_memory_to_all(local_rdma_buffer_mem);
 
     // Send local memory to other ranks.
     //
@@ -361,39 +364,39 @@ void Buffer::sync(const std::vector<int>& device_ids,
     // discussion. Cross-node LL (DeepEP's recommended 1-GPU-per-node
     // topology) is unaffected.
     // Use tag=1 to disambiguate from the NVL phase's tag=0 traffic with same-node peers.
-    constexpr int kRdmaTag = 1;
-    for (int r = 0; r < num_ranks; ++r) {
-      if (r == rank) continue;
-      communicator->sendMemory(local_rdma_buffer_mem, r, kRdmaTag);
-    }
-
-    // Receive remote memory from other ranks.
-    for (int r = 0; r < num_ranks; ++r) {
-      if (r == rank) continue;
-      auto f = communicator->recvMemory(r, kRdmaTag);
-      auto mem = f.get();
-      memory_ids[r] = add_memory_to_all(std::move(mem));
-    }
-
-    // Rank -> vector of connections
-    std::unordered_map<int, std::vector<mscclpp::Connection>> connections;
-    const mscclpp::EndpointConfig ipc_cfg(ipc_transport);
-    const mscclpp::EndpointConfig ib_cfg(ib_transport);
-
-    // Self connection for local memory (CUDA IPC).
-    connections[rank].emplace_back(communicator->connect(ipc_cfg, rank, kRdmaTag).get());
-
-    // Remote IB connections (multi-QP per peer).
-    const int num_ib_connections_per_rank = 12;  // #QPs per rank (mirrors DeepEP).
-    for (int r = 0; r < num_ranks; ++r) {
-      if (r == rank) continue;
-      std::vector<std::shared_future<mscclpp::Connection>> futures;
-      futures.reserve(num_ib_connections_per_rank);
-      for (int i = 0; i < num_ib_connections_per_rank; ++i) {
-        futures.emplace_back(communicator->connect(ib_cfg, r, kRdmaTag));
+      constexpr int kRdmaTag = 1;
+      for (int r = 0; r < num_ranks; ++r) {
+        if (r == rank) continue;
+        communicator->sendMemory(local_rdma_buffer_mem, r, kRdmaTag);
       }
-      for (auto& f : futures) connections[r].emplace_back(f.get());
-    }
+
+      // Receive remote memory from other ranks.
+      for (int r = 0; r < num_ranks; ++r) {
+        if (r == rank) continue;
+        auto f = communicator->recvMemory(r, kRdmaTag);
+        auto mem = f.get();
+        memory_ids[r] = add_memory_to_all(std::move(mem));
+      }
+
+      // Rank -> vector of connections
+      std::unordered_map<int, std::vector<mscclpp::Connection>> connections;
+      const mscclpp::EndpointConfig ipc_cfg(ipc_transport);
+      const mscclpp::EndpointConfig ib_cfg(ib_transport);
+
+      // Self connection for local memory (CUDA IPC).
+      connections[rank].emplace_back(communicator->connect(ipc_cfg, rank, kRdmaTag).get());
+
+      // Remote IB connections (multi-QP per peer).
+      const int num_ib_connections_per_rank = 12;  // #QPs per rank (mirrors DeepEP).
+      for (int r = 0; r < num_ranks; ++r) {
+        if (r == rank) continue;
+        std::vector<std::shared_future<mscclpp::Connection>> futures;
+        futures.reserve(num_ib_connections_per_rank);
+        for (int i = 0; i < num_ib_connections_per_rank; ++i) {
+          futures.emplace_back(communicator->connect(ib_cfg, r, kRdmaTag));
+        }
+        for (auto& f : futures) connections[r].emplace_back(f.get());
+      }
 
     // Rank -> vector of (proxy_idx, semaphore_id_within_proxy). Iterate
     // peers in sorted rank order so semaphore pairings between nodes line
@@ -402,19 +405,19 @@ void Buffer::sync(const std::vector<int>& device_ids,
     // index `i*num_ranks + r` lives on proxy `(i*num_ranks + r) %
     // num_proxy_services`. SemaphoreIds are local to each proxy, so we
     // record (proxy_idx, sid) pairs.
-    std::unordered_map<int, std::vector<std::pair<int, mscclpp::SemaphoreId>>> sema_ids;
-    const int num_semaphores_per_rank = 16;
-    for (int i = 0; i < num_semaphores_per_rank; ++i) {
-      for (int r = 0; r < num_ranks; ++r) {
-        auto conn_it = connections.find(r);
-        EP_HOST_ASSERT(conn_it != connections.end());
-        auto& conns = conn_it->second;
-        auto& conn = conns[i % conns.size()];
-        int proxy_idx = (i * num_ranks + r) % num_proxy_services;
-        auto sema_id = proxy_services[proxy_idx]->buildAndAddSemaphore(*communicator, conn);
-        sema_ids[r].emplace_back(proxy_idx, sema_id);
+      std::unordered_map<int, std::vector<std::pair<int, mscclpp::SemaphoreId>>> sema_ids;
+      const int num_semaphores_per_rank = 16;
+      for (int i = 0; i < num_semaphores_per_rank; ++i) {
+        for (int r = 0; r < num_ranks; ++r) {
+          auto conn_it = connections.find(r);
+          EP_HOST_ASSERT(conn_it != connections.end());
+          auto& conns = conn_it->second;
+          auto& conn = conns[i % conns.size()];
+          int proxy_idx = (i * num_ranks + r) % num_proxy_services;
+          auto sema_id = proxy_services[proxy_idx]->buildAndAddSemaphore(*communicator, conn);
+          sema_ids[r].emplace_back(proxy_idx, sema_id);
+        }
       }
-    }
 
     // Create port channels + device handles.
     //
@@ -425,25 +428,26 @@ void Buffer::sync(const std::vector<int>& device_ids,
     // Each channel inherits the proxy of the semaphore it was built on, so the
     // resulting `PortChannelDeviceHandle` routes its FIFO pushes to the correct
     // proxy thread.
-    const int num_port_channels_per_rank = num_semaphores_per_rank;
-    std::vector<mscclpp::PortChannelDeviceHandle> port_channel_handles;
-    for (int i = 0; i < num_port_channels_per_rank; ++i) {
-      for (int r = 0; r < num_ranks; ++r) {
-        auto mem_it = memory_ids.find(r);
-        EP_HOST_ASSERT(mem_it != memory_ids.end());
-        auto memory_id = mem_it->second;
-        auto [proxy_idx, sema_id] = sema_ids[r][i % sema_ids[r].size()];
-        auto port_channel = proxy_services[proxy_idx]->portChannel(sema_id, memory_id, memory_ids[rank]);
-        port_channels.emplace_back(std::move(port_channel));
-        port_channel_handles.emplace_back(port_channels.rbegin()->deviceHandle());
+      const int num_port_channels_per_rank = num_semaphores_per_rank;
+      std::vector<mscclpp::PortChannelDeviceHandle> port_channel_handles;
+      for (int i = 0; i < num_port_channels_per_rank; ++i) {
+        for (int r = 0; r < num_ranks; ++r) {
+          auto mem_it = memory_ids.find(r);
+          EP_HOST_ASSERT(mem_it != memory_ids.end());
+          auto memory_id = mem_it->second;
+          auto [proxy_idx, sema_id] = sema_ids[r][i % sema_ids[r].size()];
+          auto port_channel = proxy_services[proxy_idx]->portChannel(sema_id, memory_id, memory_ids[rank]);
+          port_channels.emplace_back(std::move(port_channel));
+          port_channel_handles.emplace_back(port_channels.rbegin()->deviceHandle());
+        }
       }
-    }
 
-    port_channel_handles_device_ptr =
-        mscclpp::detail::gpuCallocShared<mscclpp::PortChannelDeviceHandle>(port_channel_handles.size());
-    mscclpp::gpuMemcpy<mscclpp::PortChannelDeviceHandle>(port_channel_handles_device_ptr.get(),
-                                                         port_channel_handles.data(), port_channel_handles.size(),
-                                                         cudaMemcpyHostToDevice);
+      port_channel_handles_device_ptr =
+          mscclpp::detail::gpuCallocShared<mscclpp::PortChannelDeviceHandle>(port_channel_handles.size());
+      mscclpp::gpuMemcpy<mscclpp::PortChannelDeviceHandle>(port_channel_handles_device_ptr.get(),
+                                                           port_channel_handles.data(), port_channel_handles.size(),
+                                                           cudaMemcpyHostToDevice);
+    }
 
     // ------------------------------------------------------------------
     // Intra-node LL fast path setup.
@@ -457,7 +461,7 @@ void Buffer::sync(const std::vector<int>& device_ids,
     // for a barrier ring. The LL kernels select this path at launch time.
     // Cross-node LL is unaffected: this block is a no-op there.
     // ------------------------------------------------------------------
-    if (low_latency_mode and num_rdma_ranks == 1) {
+    if (ll_ipc_only) {
       EP_HOST_ASSERT(num_ranks == num_nvl_ranks);
       EP_HOST_ASSERT(num_ranks <= NUM_MAX_NVL_PEERS);
 

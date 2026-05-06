@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 #pragma once
 
+#include <cstdint>
 #include <type_traits>
 
 #include "exception.cuh"

@@ -513,10 +513,11 @@ void IBConnection::flush(int64_t timeoutUsec) {
 void IBConnection::atomicAdd(RegisteredMemory dst, uint64_t dstOffset, int64_t value) {
   validateTransport(dst, remoteTransport());
   auto dstTransportInfo = getImpl(dst).getTransportInfo(remoteTransport());
-  if (dstTransportInfo.ibLocal) {
+  auto& dstData = std::get<detail::TransportInfo<IBTransportTag>>(dstTransportInfo.data);
+  if (dstData.ibLocal) {
     THROW(CONN, Error, ErrorCode::InvalidUsage, "dst is local, which is not supported");
   }
-  auto dstMrInfo = dstTransportInfo.ibMrInfo;
+  auto dstMrInfo = dstData.ibMrInfo;
 
   if (ibNoAtomic_) {
     THROW(CONN, Error, ErrorCode::InvalidUsage, "atomicAdd is not supported in IB no-atomic mode");
@@ -831,6 +832,12 @@ struct OfiConnection::Impl {
   bool preferInjectWriteData = false;
   bool disableInjectWriteData = false;
   uint64_t remoteUpdateDstAddr = 0;
+  bool atomicCapsChecked = false;
+  bool atomicSupported = false;
+  size_t atomicMaxCount = 0;
+#if defined(MSCCLPP_USE_OFI)
+  fi_datatype atomicDatatype = FI_INT64;
+#endif
 
   std::unique_ptr<uint64_t> updateScratch;
   std::unique_ptr<const OfiMr> updateScratchMr;
@@ -1035,6 +1042,115 @@ void OfiConnection::write(RegisteredMemory dst, uint64_t dstOffset, RegisteredMe
 #endif
 }
 
+void OfiConnection::atomicAdd(RegisteredMemory dst, uint64_t dstOffset, int64_t value) {
+#if defined(MSCCLPP_USE_OFI)
+  if (!impl_ || !impl_->resources) {
+    THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
+  }
+  if (!impl_->atomicCapsChecked) {
+    size_t maxCountI64 = 0;
+    size_t maxCountU64 = 0;
+    int validRcI64 = fi_atomicvalid(impl_->resources->ep(), FI_INT64, FI_SUM, &maxCountI64);
+    int validRcU64 = fi_atomicvalid(impl_->resources->ep(), FI_UINT64, FI_SUM, &maxCountU64);
+    impl_->atomicCapsChecked = true;
+    if (validRcI64 == 0 && maxCountI64 >= 1) {
+      impl_->atomicSupported = true;
+      impl_->atomicDatatype = FI_INT64;
+      impl_->atomicMaxCount = maxCountI64;
+    } else if (validRcU64 == 0 && maxCountU64 >= 1) {
+      impl_->atomicSupported = true;
+      impl_->atomicDatatype = FI_UINT64;
+      impl_->atomicMaxCount = maxCountU64;
+    }
+    INFO(CONN, "OfiConnection atomic capabilities: int64_rc=", validRcI64,
+         " int64_maxCount=", maxCountI64,
+         " uint64_rc=", validRcU64,
+         " uint64_maxCount=", maxCountU64,
+         " chosen_datatype=", static_cast<int>(impl_->atomicDatatype),
+         " supported=", impl_->atomicSupported);
+  }
+  if (!impl_->atomicSupported) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage,
+          "OFI atomicAdd(FI_SUM on 64-bit integer) is not supported by this provider/endpoint");
+  }
+  if ((dstOffset % alignof(int64_t)) != 0) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage, "OfiConnection::atomicAdd requires 8-byte aligned dstOffset");
+  }
+
+  validateTransport(dst, remoteTransport(), dstOffset, sizeof(int64_t));
+
+  auto dstTransportInfo = getImpl(dst).getTransportInfo(remoteTransport());
+  auto& dstData = std::get<TransportInfoType<Transport::Ofi>>(dstTransportInfo.data);
+  if (dstData.ofiLocal) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage, "dst is local, which is not supported");
+  }
+
+  uint64_t remoteAddr = dstData.ofiMrInfo.addr + dstOffset;
+  if ((remoteAddr % alignof(int64_t)) != 0) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage, "OfiConnection::atomicAdd requires 8-byte aligned remote address");
+  }
+
+  *reinterpret_cast<int64_t*>(impl_->updateScratch.get()) = value;
+
+  fi_ioc localIov = {};
+  localIov.addr = impl_->updateScratch.get();
+  localIov.count = 1;
+
+  fi_rma_ioc remoteIov = {};
+  remoteIov.addr = remoteAddr;
+  remoteIov.count = 1;
+  remoteIov.key = dstData.ofiMrInfo.rkey;
+
+  void* descs[1] = {impl_->updateScratchMr->desc()};
+  Impl::CompletionContext op{};
+
+  fi_msg_atomic msg = {};
+  msg.msg_iov = &localIov;
+  msg.desc = descs;
+  msg.iov_count = 1;
+  msg.addr = impl_->peerAddr;
+  msg.rma_iov = &remoteIov;
+  msg.rma_iov_count = 1;
+  msg.datatype = impl_->atomicDatatype;
+  msg.op = FI_SUM;
+  msg.context = &op;
+  msg.data = 0;
+
+  for (;;) {
+    int rc = fi_atomicmsg(impl_->resources->ep(), &msg, FI_COMPLETION);
+    if (rc == 0) {
+      ++impl_->outstandingTx;
+      ++impl_->writesPostedCq;
+      break;
+    }
+    if (rc == -FI_EAGAIN) {
+      if (!progressCompletionsOnce()) {
+        std::this_thread::yield();
+      }
+      continue;
+    }
+    if (rc == -FI_EOPNOTSUPP || rc == -FI_ENOSYS || rc == -FI_EINVAL) {
+      THROW(CONN, Error, ErrorCode::InvalidUsage,
+            "OFI atomicAdd is not supported by this provider/endpoint configuration; rc=", rc);
+    }
+    checkOfiConn(rc, "fi_atomicmsg(atomicAdd)");
+  }
+
+  DEBUG(CONN, "OfiConnection atomicAdd: remote=", reinterpret_cast<void*>(remoteAddr),
+        " value=", value,
+        " rkey=", dstData.ofiMrInfo.rkey,
+        " outstandingTx=", impl_->outstandingTx,
+        " writesPostedCq=", impl_->writesPostedCq,
+        " cqCompletionsSeen=", impl_->cqCompletionsSeen);
+#else
+  (void)dst;
+  (void)dstOffset;
+  (void)value;
+  THROW(CONN, Error, ErrorCode::InvalidUsage,
+        "OFI transport requested but MSCCLPP was built without OFI support");
+#endif
+}
+
 void OfiConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint64_t* src, uint64_t newValue) {
 #if defined(MSCCLPP_USE_OFI)
   if (!impl_ || !impl_->resources) {
@@ -1196,26 +1312,42 @@ void OfiConnection::flush(int64_t timeoutUsec) {
   }
 
   const uint64_t target = impl_->postedWrites;
-  if (target == 0) {
+  if (target == 0 && impl_->outstandingTx == 0) {
     return;
   }
 
+  const auto start = std::chrono::steady_clock::now();
   const auto deadline =
       (timeoutUsec < 0)
           ? std::chrono::steady_clock::time_point::max()
-          : std::chrono::steady_clock::now() + std::chrono::microseconds(timeoutUsec);
+          : start + std::chrono::microseconds(timeoutUsec);
 
-  while (true) {
-    const auto completed = fi_cntr_read(impl_->resources->txCntr());
-    impl_->cntrCompletionsSeen = completed;
-    if (completed >= target) {
-      break;
+  if (target != 0) {
+    while (true) {
+      const auto completed = fi_cntr_read(impl_->resources->txCntr());
+      impl_->cntrCompletionsSeen = completed;
+      if (completed >= target) {
+        break;
+      }
+      if (timeoutUsec >= 0 && std::chrono::steady_clock::now() >= deadline) {
+        THROW(CONN, Error, ErrorCode::Aborted,
+              "OfiConnection::flush timed out waiting for write counter");
+      }
+      std::this_thread::yield();
     }
-    if (timeoutUsec >= 0 && std::chrono::steady_clock::now() >= deadline) {
-      THROW(CONN, Error, ErrorCode::Aborted,
-            "OfiConnection::flush timed out waiting for write counter");
+  }
+
+  if (impl_->outstandingTx != 0) {
+    int64_t cqTimeoutUsec = -1;
+    if (timeoutUsec >= 0) {
+      auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        THROW(CONN, Error, ErrorCode::Aborted,
+              "OfiConnection::flush timed out waiting for CQ completions");
+      }
+      cqTimeoutUsec = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count();
     }
-    std::this_thread::yield();
+    waitForCompletions(cqTimeoutUsec, nullptr, /*drainAll=*/true);
   }
 
   DEBUG(CONN, "OfiConnection::flush: postedWrites=", impl_->postedWrites,

@@ -211,6 +211,8 @@ class OfiConnection : public BaseConnection {
 
   void updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint64_t* src, uint64_t newValue) override;
 
+  void atomicAdd(RegisteredMemory dst, uint64_t dstOffset, int64_t value) override;
+
   void flush(int64_t timeoutUsec) override;
 
   std::unique_ptr<OfiMr const> registerOfiMr(void* data, size_t size) const override;

@@ -6,6 +6,7 @@
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
 #include <rdma/fi_errno.h>
+#include <rdma/fi_atomic.h>
 #include <rdma/fi_rma.h>
 
 #endif // MSCCLPP_OFI_WRAPPER_HPP_
