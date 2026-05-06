@@ -18,6 +18,7 @@
 #include "endpoint.hpp"
 #include "gdr.hpp"
 #include "ib.hpp"
+#include "ofi.hpp"
 #include "registered_memory.hpp"
 #include "socket.h"
 
@@ -50,6 +51,11 @@ class BaseConnection {
   /// When false, the NIC writes directly to the semaphore's registered memory (e.g., via atomics).
   virtual bool isSignalForwarding() const { return false; }
 
+  virtual std::unique_ptr<OfiMr const> registerOfiMr(void* data, size_t size) const;
+
+  /// Progress transport-specific background work without blocking.
+  virtual void progress() {}
+
   virtual Transport transport() const = 0;
 
   virtual Transport remoteTransport() const = 0;
@@ -61,13 +67,16 @@ class BaseConnection {
   int getMaxWriteQueueSize() const;
 
   static std::shared_ptr<BaseConnection>& getImpl(Connection& conn) { return conn.impl_; }
+  static BaseConnection const* getImpl(const Connection& conn) { return conn.impl_.get(); }
 
  protected:
   friend class Context;
   friend class CudaIpcConnection;
   friend class IBConnection;
   friend class EthernetConnection;
+  friend class OfiConnection;
 
+  static Endpoint::Impl& getImpl(Endpoint& endpoint);
   static const Endpoint::Impl& getImpl(const Endpoint& endpoint);
   static const RegisteredMemory::Impl& getImpl(const RegisteredMemory& memory);
   static Context::Impl& getImpl(Context& context);
@@ -102,7 +111,7 @@ class IBConnection : public BaseConnection {
   std::weak_ptr<IbQp> qp_;
   std::unique_ptr<uint64_t> atomicSrc_;
   RegisteredMemory atomicSrcMem_;
-  mscclpp::TransportInfo atomicSrcTransportInfo_;
+  detail::TransportInfo<IBTransportTag> atomicSrcTransportInfo_;
 
   // For write-with-imm mode (HostNoAtomic): uses RDMA write-with-imm to signal
   // instead of atomic operations, with a host thread forwarding to GPU for memory consistency.
@@ -180,6 +189,41 @@ class EthernetConnection : public BaseConnection {
   void updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint64_t* src, uint64_t newValue) override;
 
   void flush(int64_t timeoutUsec) override;
+};
+
+class OfiConnection : public BaseConnection {
+ public:
+  OfiConnection(std::shared_ptr<Context> context, const Endpoint& localEndpoint, const Endpoint& remoteEndpoint);
+
+  ~OfiConnection();
+
+  Transport transport() const override;
+
+  Transport remoteTransport() const override;
+
+  void write(RegisteredMemory dst, uint64_t dstOffset, RegisteredMemory src, uint64_t srcOffset,
+             uint64_t size) override;
+
+  void updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint64_t* src, uint64_t newValue) override;
+
+  void flush(int64_t timeoutUsec) override;
+
+  std::unique_ptr<OfiMr const> registerOfiMr(void* data, size_t size) const override;
+
+  void startSignalForwarding(std::shared_ptr<uint64_t> mem) override;
+
+  void stopSignalForwarding() override;
+
+  bool isSignalForwarding() const override;
+
+  void progress() override;
+
+ private:
+  struct Impl;
+  bool progressInboundSignalsOnce();
+  bool progressCompletionsOnce();
+  void waitForCompletions(int64_t timeoutUsec, void* targetContext, bool drainAll);
+  std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace mscclpp

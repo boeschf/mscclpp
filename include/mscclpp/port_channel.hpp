@@ -9,6 +9,8 @@
 #include "proxy.hpp"
 #include "semaphore.hpp"
 
+#include <mutex>
+
 namespace mscclpp {
 
 struct BasePortChannel;
@@ -84,7 +86,11 @@ class ProxyService : public BaseProxyService {
   std::vector<RegisteredMemory> memories_;
   std::shared_ptr<Proxy> proxy_;
   std::unordered_map<std::shared_ptr<BaseConnection>, int> inflightRequests_;
+  std::vector<std::shared_ptr<BaseConnection>> connections_;
+  mutable std::mutex connectionsMutex_;
 
+  void progressConnections();
+  void maybeTrackConnection(const Connection& connection);
   ProxyHandlerResult handleTrigger(ProxyTrigger triggerRaw);
 };
 

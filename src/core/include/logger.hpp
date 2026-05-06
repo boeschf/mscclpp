@@ -97,7 +97,9 @@ class Logger {
 
   template <typename T>
   std::string toStringHelper(T&& value) const {
-    if constexpr (std::is_same_v<std::decay_t<T>, std::string_view>) {
+    if constexpr (std::is_same_v<std::decay_t<T>, const char*>) {
+      return std::string(value);
+    } else if constexpr (std::is_same_v<std::decay_t<T>, std::string_view>) {
       return std::string(value);
     } else if constexpr (std::is_same_v<std::decay_t<T>, std::string>) {
       return std::forward<T>(value);

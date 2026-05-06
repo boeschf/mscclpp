@@ -10,14 +10,23 @@
 #include <mscclpp/atomic_device.hpp>
 #include <mscclpp/numa.hpp>
 #include <mscclpp/utils.hpp>
+#include <chrono>
+#include <cstring>
+#include <cstdlib>
 #include <sstream>
 #include <thread>
 
 #include "api.h"
+#include "atomic.hpp"
 #include "context.hpp"
 #include "endpoint.hpp"
 #include "gpu_utils_internal.hpp"
 #include "logger.hpp"
+#include "ofi.hpp"
+
+#if defined(MSCCLPP_USE_OFI)
+#include "ofi_wrapper.hpp"
+#endif
 
 namespace mscclpp {
 
@@ -36,6 +45,8 @@ static bool isSameProcess(const Endpoint& a, const Endpoint& b) {
 
 // BaseConnection
 
+Endpoint::Impl& BaseConnection::getImpl(Endpoint& endpoint) { return *endpoint.pimpl_; }
+
 const Endpoint::Impl& BaseConnection::getImpl(const Endpoint& endpoint) { return *(endpoint.pimpl_); }
 
 const RegisteredMemory::Impl& BaseConnection::getImpl(const RegisteredMemory& memory) { return *(memory.pimpl_); }
@@ -50,6 +61,12 @@ MSCCLPP_API_CPP std::shared_ptr<Context> BaseConnection::context() const { retur
 MSCCLPP_API_CPP const Device& BaseConnection::localDevice() const { return localEndpoint_.device(); }
 
 MSCCLPP_API_CPP int BaseConnection::getMaxWriteQueueSize() const { return maxWriteQueueSize_; }
+
+std::unique_ptr<const OfiMr> BaseConnection::registerOfiMr(void* data, size_t size) const {
+  (void)data;
+  (void)size;
+  THROW(CONN, Error, ErrorCode::InvalidUsage, "This connection does not support endpoint-scoped OFI MR registration");
+}
 
 // Connection wrapper
 
@@ -272,7 +289,8 @@ IBConnection::IBConnection(std::shared_ptr<Context> context, const Endpoint& loc
   qp_.lock()->rts();
   atomicSrcMem_ = context->registerMemory(atomicSrc_.get(), sizeof(uint64_t), transport_);
   validateTransport(atomicSrcMem_, transport_);
-  atomicSrcTransportInfo_ = getImpl(atomicSrcMem_).getTransportInfo(transport_);
+  atomicSrcTransportInfo_ =
+      std::get<detail::TransportInfo<IBTransportTag>>(getImpl(atomicSrcMem_).getTransportInfo(transport_).data);
 
   if (ibNoAtomic_) {
 #if defined(MSCCLPP_USE_CUDA)
@@ -371,16 +389,18 @@ void IBConnection::write(RegisteredMemory dst, uint64_t dstOffset, RegisteredMem
   validateTransport(src, transport(), srcOffset, size);
 
   auto dstTransportInfo = getImpl(dst).getTransportInfo(remoteTransport());
-  if (dstTransportInfo.ibLocal) {
+  auto& dstData = std::get<detail::TransportInfo<IBTransportTag>>(dstTransportInfo.data);
+  if (dstData.ibLocal) {
     THROW(CONN, Error, ErrorCode::InvalidUsage, "dst is local, which is not supported");
   }
   auto srcTransportInfo = getImpl(src).getTransportInfo(transport());
-  if (!srcTransportInfo.ibLocal) {
+  auto& srcData = std::get<detail::TransportInfo<IBTransportTag>>(srcTransportInfo.data);
+  if (!srcData.ibLocal) {
     THROW(CONN, Error, ErrorCode::InvalidUsage, "src is remote, which is not supported");
   }
 
-  auto dstMrInfo = dstTransportInfo.ibMrInfo;
-  auto srcMr = srcTransportInfo.ibMr;
+  auto dstMrInfo = dstData.ibMrInfo;
+  auto srcMr = srcData.ibMr;
 
   qp_.lock()->stageSendWrite(srcMr, dstMrInfo, (uint32_t)size, /*wrId=*/0, /*srcOffset=*/srcOffset,
                              /*dstOffset=*/dstOffset, /*signaled=*/true);
@@ -401,11 +421,12 @@ void IBConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint6
 
   validateTransport(dst, remoteTransport());
   auto dstTransportInfo = getImpl(dst).getTransportInfo(remoteTransport());
-  if (dstTransportInfo.ibLocal) {
+  auto& dstData = std::get<detail::TransportInfo<IBTransportTag>>(dstTransportInfo.data);
+  if (dstData.ibLocal) {
     THROW(CONN, Error, ErrorCode::InvalidUsage, "dst is local, which is not supported");
   }
 
-  auto dstMrInfo = dstTransportInfo.ibMrInfo;
+  auto dstMrInfo = dstData.ibMrInfo;
   // assert that src is on host
   uint64_t oldValue = *src;
   *src = newValue;
@@ -669,6 +690,661 @@ void EthernetConnection::recvMessages() {
     NpKit::CollectCpuEvent(NPKIT_EVENT_CONN_ETH_RECV_DATA_EXIT, uint32_t(size), 0, *NpKit::GetCpuTimestamp(), 1);
 #endif
   }
+}
+
+
+namespace {
+
+#if defined(MSCCLPP_USE_OFI)
+constexpr uint32_t kOfiEndpointFlagWriteData = 1u << 0;
+
+bool envEnabled(const char* name) {
+  const char* v = std::getenv(name);
+  if (v == nullptr) {
+    return false;
+  }
+  return (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 || std::strcmp(v, "TRUE") == 0 ||
+          std::strcmp(v, "on") == 0 || std::strcmp(v, "ON") == 0);
+}
+
+void checkOfiConn(int rc, char const* what) {
+  if (rc < 0) {
+    THROW(CONN, Error, ErrorCode::SystemError, what, " failed: ", fi_strerror(-rc), " (rc=", rc, ")");
+  }
+}
+
+struct OfiConsumeGuard {
+  explicit OfiConsumeGuard(std::atomic<bool>& consumed) : consumed_(&consumed) {}
+
+  void dismiss() noexcept { consumed_ = nullptr; }
+
+  ~OfiConsumeGuard() {
+    if (consumed_ != nullptr) {
+      consumed_->store(false, std::memory_order_release);
+    }
+  }
+
+ private:
+  std::atomic<bool>* consumed_;
+};
+#endif  // defined(MSCCLPP_USE_OFI)
+
+}  // namespace
+
+struct OfiConnection::Impl {
+  struct CompletionContext {
+#if defined(MSCCLPP_USE_OFI)
+    fi_context _reserved = {};  // reserved for OFI completion context (must be first member)
+#endif  // defined(MSCCLPP_USE_OFI)
+    bool done = false;
+  };
+
+  Impl() = default;
+
+  std::unique_ptr<OfiEndpointResources> resources;  // owned by the connection after consume
+#if defined(MSCCLPP_USE_OFI)
+  fi_addr_t peerAddr = FI_ADDR_UNSPEC;
+#endif  // defined(MSCCLPP_USE_OFI)
+  uint64_t outstandingTx = 0;
+  uint64_t postedWrites = 0;
+  uint64_t writesPostedNoCq = 0;
+  uint64_t writesPostedCq = 0;
+  uint64_t cqCompletionsSeen = 0;
+  uint64_t rxCqCompletionsSeen = 0;
+  uint64_t cntrCompletionsSeen = 0;
+  bool useWriteDataSignal = false;
+  bool preferInjectWriteData = false;
+  bool disableInjectWriteData = false;
+  uint64_t remoteUpdateDstAddr = 0;
+
+  std::unique_ptr<uint64_t> updateScratch;
+  std::unique_ptr<const OfiMr> updateScratchMr;
+};
+
+OfiConnection::OfiConnection(std::shared_ptr<Context> context, Endpoint const& localEndpoint,
+                             Endpoint const& remoteEndpoint)
+    : BaseConnection(context, localEndpoint) {
+  if (localEndpoint.transport() != Transport::Ofi || remoteEndpoint.transport() != Transport::Ofi) {
+    THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection requires Transport::Ofi endpoints");
+  }
+
+#if defined(MSCCLPP_USE_OFI)
+  Endpoint& mutableLocalEndpoint = localEndpoint_;
+  auto& localImpl = getImpl(mutableLocalEndpoint);
+  auto const& remoteImpl = getImpl(remoteEndpoint);
+
+  if (!localImpl.ofiResources_) {
+    THROW(CONN, Error, ErrorCode::InternalError,
+          "Local OFI endpoint is missing runtime OFI resources");
+  }
+  if (remoteImpl.ofiWireInfo_.addr.empty()) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage,
+          "Remote OFI endpoint has no serialized address");
+  }
+
+  bool expected = false;
+  if (!localImpl.ofiConsumed_.compare_exchange_strong(expected, true,
+                                                      std::memory_order_acq_rel,
+                                                      std::memory_order_acquire)) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage,
+          "Local OFI endpoint has already been consumed by another OfiConnection");
+  }
+  OfiConsumeGuard consumeGuard(localImpl.ofiConsumed_);
+
+  impl_ = std::make_unique<Impl>();
+
+  // While construction is in progress, the endpoint still temporarily owns the resources.
+  OfiEndpointResources* localResources = localImpl.ofiResources_.get();
+
+  int rc = fi_av_insert(localResources->av(),
+                        remoteImpl.ofiWireInfo_.addr.data(),
+                        1,
+                        &impl_->peerAddr,
+                        0,
+                        nullptr);
+  if (rc != 1) {
+    if (rc >= 0) {
+      THROW(CONN, Error, ErrorCode::SystemError,
+            "fi_av_insert inserted unexpected number of addresses: ", rc);
+    }
+    checkOfiConn(rc, "fi_av_insert");
+  }
+
+  // Ownership transfer:
+  // once the endpoint is consumed successfully, the connection becomes the
+  // exclusive owner of the OFI EP/AV/CQ/progress resources.
+  impl_->resources = std::move(localImpl.ofiResources_);
+
+  const bool localWriteData = localResources->supportsWriteData();
+  const bool remoteWriteData = (remoteImpl.ofiWireInfo_.flags & kOfiEndpointFlagWriteData) != 0;
+  const bool cxiWriteDataEnabled = envEnabled("FI_CXI_ENABLE_WRITEDATA");
+  impl_->useWriteDataSignal = localWriteData && remoteWriteData && cxiWriteDataEnabled;
+  impl_->preferInjectWriteData = envEnabled("MSCCLPP_OFI_INJECT_WRITEDATA");
+
+  impl_->updateScratch = std::make_unique<uint64_t>(0);
+  impl_->updateScratchMr = std::make_unique<const OfiMr>(
+      *impl_->resources,
+      impl_->updateScratch.get(),
+      sizeof(uint64_t),
+      classifyOfiMemory(impl_->updateScratch.get()));
+
+  INFO(CONN, "OfiConnection created: local EP ", impl_->resources->ep(),
+       ", peerAddr=", static_cast<uint64_t>(impl_->peerAddr),
+       ", remoteAddrBytes=", remoteImpl.ofiWireInfo_.addr.size(),
+       ", localWriteData=", localWriteData,
+       ", remoteWriteData=", remoteWriteData,
+       ", cxiWriteDataEnabled=", cxiWriteDataEnabled,
+       ", useWriteDataSignal=", impl_->useWriteDataSignal,
+       ", preferInjectWriteData=", impl_->preferInjectWriteData);
+
+  consumeGuard.dismiss();
+#else
+  (void)remoteEndpoint;
+  THROW(CONN, Error, ErrorCode::InvalidUsage,
+        "OFI transport requested but MSCCLPP was built without OFI support");
+#endif
+}
+
+OfiConnection::~OfiConnection() = default;
+
+Transport OfiConnection::transport() const { return Transport::Ofi; }
+
+Transport OfiConnection::remoteTransport() const { return Transport::Ofi; }
+
+bool OfiConnection::isSignalForwarding() const {
+#if defined(MSCCLPP_USE_OFI)
+  return impl_ && impl_->useWriteDataSignal;
+#else
+  return false;
+#endif
+}
+
+void OfiConnection::startSignalForwarding(std::shared_ptr<uint64_t> mem) {
+#if defined(MSCCLPP_USE_OFI)
+  if (!impl_ || !impl_->resources) {
+    THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
+  }
+  if (!impl_->useWriteDataSignal) {
+    return;
+  }
+  impl_->remoteUpdateDstAddr = reinterpret_cast<uint64_t>(mem.get());
+  INFO(CONN, "OfiConnection startSignalForwarding: ", reinterpret_cast<void*>(impl_->remoteUpdateDstAddr));
+#else
+  (void)mem;
+  THROW(CONN, Error, ErrorCode::InvalidUsage,
+        "OFI transport requested but MSCCLPP was built without OFI support");
+#endif
+}
+
+void OfiConnection::stopSignalForwarding() {
+#if defined(MSCCLPP_USE_OFI)
+  if (!impl_) {
+    return;
+  }
+  impl_->remoteUpdateDstAddr = 0;
+  INFO(CONN, "OfiConnection stopSignalForwarding");
+#endif
+}
+
+void OfiConnection::progress() {
+#if defined(MSCCLPP_USE_OFI)
+  (void)progressInboundSignalsOnce();
+#endif
+}
+
+void OfiConnection::write(RegisteredMemory dst, uint64_t dstOffset, RegisteredMemory src, uint64_t srcOffset,
+                          uint64_t size) {
+#if defined(MSCCLPP_USE_OFI)
+  if (!impl_ || !impl_->resources) {
+    THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
+  }
+  validateTransport(dst, remoteTransport(), dstOffset, size);
+  validateTransport(src, transport(), srcOffset, size);
+
+  auto dstTransportInfo = getImpl(dst).getTransportInfo(remoteTransport());
+  auto& dstData = std::get<TransportInfoType<Transport::Ofi>>(dstTransportInfo.data);
+  if (dstData.ofiLocal) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage, "dst is local, which is not supported");
+  }
+
+  auto srcTransportInfo = getImpl(src).getTransportInfo(transport());
+  auto& srcData = std::get<TransportInfoType<Transport::Ofi>>(srcTransportInfo.data);
+  if (!srcData.ofiLocal) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage, "src is remote, which is not supported");
+  }
+  if (srcData.ofiMr == nullptr) {
+    THROW(CONN, Error, ErrorCode::InternalError, "Local OFI source memory is missing an OFI MR");
+  }
+
+  auto localBuf = static_cast<void*>(static_cast<uint8_t*>(getImpl(src).data) + srcOffset);
+  auto remoteAddr = dstData.ofiMrInfo.addr + dstOffset;
+
+  for (;;) {
+    int rc = fi_write(impl_->resources->ep(),
+                      localBuf,
+                      static_cast<size_t>(size),
+                      srcData.ofiMr->desc(),
+                      impl_->peerAddr,
+                      remoteAddr,
+                      dstData.ofiMrInfo.rkey,
+                      /*context=*/nullptr);
+    if (rc == 0) {
+      break;
+    }
+    if (rc == -FI_EAGAIN) {
+      std::this_thread::yield();
+      continue;
+    }
+    checkOfiConn(rc, "fi_write");
+  }
+
+  ++impl_->postedWrites;
+  ++impl_->writesPostedNoCq;
+
+  DEBUG(CONN, "OfiConnection write: local=", localBuf,
+       " remote=", reinterpret_cast<void*>(remoteAddr),
+       " size=", size,
+       " rkey=", dstData.ofiMrInfo.rkey,
+       " outstandingTx=", impl_->outstandingTx,
+       " postedWrites=", impl_->postedWrites,
+       " writesPostedNoCq=", impl_->writesPostedNoCq,
+       " writesPostedCq=", impl_->writesPostedCq);
+#else
+  (void)dst;
+  (void)dstOffset;
+  (void)src;
+  (void)srcOffset;
+  (void)size;
+  THROW(CONN, Error, ErrorCode::InvalidUsage,
+        "OFI transport requested but MSCCLPP was built without OFI support");
+#endif
+}
+
+void OfiConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint64_t* src, uint64_t newValue) {
+#if defined(MSCCLPP_USE_OFI)
+  if (!impl_ || !impl_->resources) {
+    THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
+  }
+  if (src == nullptr) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage, "src must not be null");
+  }
+  validateTransport(dst, remoteTransport(), dstOffset, sizeof(uint64_t));
+
+  auto dstTransportInfo = getImpl(dst).getTransportInfo(remoteTransport());
+  auto& dstData = std::get<TransportInfoType<Transport::Ofi>>(dstTransportInfo.data);
+  if (dstData.ofiLocal) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage, "dst is local, which is not supported");
+  }
+
+  uint64_t oldValue = *src;
+  *src = newValue;
+  *impl_->updateScratch = newValue;
+
+  flush(-1);
+
+  if (impl_->useWriteDataSignal) {
+    if (impl_->preferInjectWriteData && !impl_->disableInjectWriteData) {
+      for (;;) {
+        int rc = fi_inject_writedata(impl_->resources->ep(),
+                                     nullptr,
+                                     0,
+                                     newValue,
+                                     impl_->peerAddr,
+                                     dstData.ofiMrInfo.addr + dstOffset,
+                                     dstData.ofiMrInfo.rkey);
+        if (rc == 0) {
+          DEBUG(CONN, "OfiConnection updateAndSync(inject_writedata): value ", oldValue, " -> ", newValue,
+                " remote=", reinterpret_cast<void*>(dstData.ofiMrInfo.addr + dstOffset),
+                " rkey=", dstData.ofiMrInfo.rkey);
+          return;
+        }
+
+        if (rc == -FI_EAGAIN) {
+          std::this_thread::yield();
+          continue;
+        }
+
+        if (rc == -FI_EOPNOTSUPP || rc == -FI_ENOSYS || rc == -FI_EINVAL) {
+          impl_->disableInjectWriteData = true;
+          WARN(CONN, "fi_inject_writedata unsupported, falling back to fi_writedata; rc=", rc);
+          break;
+        }
+
+        checkOfiConn(rc, "fi_inject_writedata(updateAndSync)");
+      }
+    }
+
+    for (;;) {
+      int rc = fi_writedata(impl_->resources->ep(),
+                            nullptr,
+                            0,
+                            nullptr,
+                            newValue,
+                            impl_->peerAddr,
+                            dstData.ofiMrInfo.addr + dstOffset,
+                            dstData.ofiMrInfo.rkey,
+                            nullptr);
+      if (rc == 0) {
+        ++impl_->postedWrites;
+        ++impl_->writesPostedNoCq;
+        break;
+      }
+
+      if (rc == -FI_EAGAIN) {
+        std::this_thread::yield();
+        continue;
+      }
+
+      if (rc == -FI_EOPNOTSUPP || rc == -FI_ENOSYS || rc == -FI_EINVAL) {
+        THROW(CONN, Error, ErrorCode::SystemError,
+              "fi_writedata unsupported while OFI signal forwarding is enabled; rc=", rc);
+      }
+
+      checkOfiConn(rc, "fi_writedata(updateAndSync)");
+    }
+
+    DEBUG(CONN, "OfiConnection updateAndSync(writedata): value ", oldValue, " -> ", newValue,
+          " remote=", reinterpret_cast<void*>(dstData.ofiMrInfo.addr + dstOffset),
+          " rkey=", dstData.ofiMrInfo.rkey,
+          " postedWrites=", impl_->postedWrites,
+          " writesPostedNoCq=", impl_->writesPostedNoCq,
+          " cntrCompletionsSeen=", impl_->cntrCompletionsSeen);
+
+    flush(5 * 1000 * 1000);
+    return;
+  }
+
+  Impl::CompletionContext op{};
+
+  iovec localIov = {};
+  localIov.iov_base = impl_->updateScratch.get();
+  localIov.iov_len = sizeof(uint64_t);
+
+  fi_rma_iov remoteIov = {};
+  remoteIov.addr = dstData.ofiMrInfo.addr + dstOffset;
+  remoteIov.len = sizeof(uint64_t);
+  remoteIov.key = dstData.ofiMrInfo.rkey;
+
+  void* descs[1] = {impl_->updateScratchMr->desc()};
+
+  fi_msg_rma msg = {};
+  msg.msg_iov = &localIov;
+  msg.desc = descs;
+  msg.iov_count = 1;
+  msg.addr = impl_->peerAddr;
+  msg.rma_iov = &remoteIov;
+  msg.rma_iov_count = 1;
+  msg.context = &op;
+  msg.data = 0;
+
+  for (;;) {
+    int rc = fi_writemsg(impl_->resources->ep(), &msg, FI_COMPLETION);
+    if (rc == 0) {
+      ++impl_->outstandingTx;
+      ++impl_->writesPostedCq;
+      break;
+    }
+
+    if (rc == -FI_EAGAIN) {
+      if (!progressCompletionsOnce()) {
+        std::this_thread::yield();
+      }
+      continue;
+    }
+
+    checkOfiConn(rc, "fi_writemsg(updateAndSync)");
+  }
+
+  DEBUG(CONN, "OfiConnection updateAndSync: value ", oldValue, " -> ", newValue,
+       " remote=", reinterpret_cast<void*>(remoteIov.addr),
+       " rkey=", remoteIov.key,
+       " outstandingTx=", impl_->outstandingTx,
+       " writesPostedNoCq=", impl_->writesPostedNoCq,
+       " writesPostedCq=", impl_->writesPostedCq,
+       " cqCompletionsSeen=", impl_->cqCompletionsSeen,
+       " cntrCompletionsSeen=", impl_->cntrCompletionsSeen);
+
+  waitForCompletions(5 * 1000 * 1000, &op, /*drainAll=*/false);
+#else
+  (void)dst;
+  (void)dstOffset;
+  (void)src;
+  (void)newValue;
+  THROW(CONN, Error, ErrorCode::InvalidUsage,
+        "OFI transport requested but MSCCLPP was built without OFI support");
+#endif
+}
+void OfiConnection::flush(int64_t timeoutUsec) {
+#if defined(MSCCLPP_USE_OFI)
+  if (!impl_ || !impl_->resources) {
+    THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
+  }
+
+  const uint64_t target = impl_->postedWrites;
+  if (target == 0) {
+    return;
+  }
+
+  const auto deadline =
+      (timeoutUsec < 0)
+          ? std::chrono::steady_clock::time_point::max()
+          : std::chrono::steady_clock::now() + std::chrono::microseconds(timeoutUsec);
+
+  while (true) {
+    const auto completed = fi_cntr_read(impl_->resources->txCntr());
+    impl_->cntrCompletionsSeen = completed;
+    if (completed >= target) {
+      break;
+    }
+    if (timeoutUsec >= 0 && std::chrono::steady_clock::now() >= deadline) {
+      THROW(CONN, Error, ErrorCode::Aborted,
+            "OfiConnection::flush timed out waiting for write counter");
+    }
+    std::this_thread::yield();
+  }
+
+  DEBUG(CONN, "OfiConnection::flush: postedWrites=", impl_->postedWrites,
+       " writesPostedNoCq=", impl_->writesPostedNoCq,
+       " writesPostedCq=", impl_->writesPostedCq,
+       " cntrCompletionsSeen=", impl_->cntrCompletionsSeen,
+       " cqCompletionsSeen=", impl_->cqCompletionsSeen,
+       " outstandingTx=", impl_->outstandingTx);
+#else
+  (void)timeoutUsec;
+  THROW(CONN, Error, ErrorCode::InvalidUsage,
+        "OFI transport requested but MSCCLPP was built without OFI support");
+#endif
+}
+
+bool OfiConnection::progressInboundSignalsOnce() {
+#if defined(MSCCLPP_USE_OFI)
+  if (!impl_ || !impl_->resources) {
+    THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
+  }
+  if (impl_->remoteUpdateDstAddr == 0) {
+    return false;
+  }
+
+  fi_cq_data_entry entries[8];
+  auto rc = fi_cq_read(impl_->resources->rxCq(), entries, 8);
+  if (rc > 0) {
+    impl_->rxCqCompletionsSeen += static_cast<uint64_t>(rc);
+    for (ssize_t i = 0; i < rc; ++i) {
+      if ((entries[i].flags & FI_REMOTE_CQ_DATA) == 0) {
+        continue;
+      }
+      uint64_t value = entries[i].data;
+      auto* dstPtr = reinterpret_cast<uint64_t*>(impl_->remoteUpdateDstAddr);
+      int dstGpuId = detail::gpuIdFromAddress(dstPtr);
+      int currentDevice = -1;
+      (void)cudaGetDevice(&currentDevice);
+      if (localDevice().type == DeviceType::GPU && dstGpuId >= 0) {
+        CudaDeviceGuard deviceGuard(localDevice().id);
+        MSCCLPP_CUTHROW(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(dstPtr), &value, sizeof(value)));
+      } else {
+        atomicStore(dstPtr, value, memoryOrderRelease);
+      }
+      DEBUG(CONN, "OfiConnection inbound signal: value=", value,
+           " dst=", dstPtr,
+           " dstGpuId=", dstGpuId,
+           " currentDevice=", currentDevice,
+           " rxCqCompletionsSeen=", impl_->rxCqCompletionsSeen);
+    }
+    return true;
+  }
+
+  if (rc == -FI_EAGAIN) {
+    return false;
+  }
+
+  if (rc == -FI_EAVAIL) {
+    fi_cq_err_entry err = {};
+    auto errRc = fi_cq_readerr(impl_->resources->rxCq(), &err, 0);
+    if (errRc < 0) {
+      THROW(CONN, Error, ErrorCode::SystemError,
+            "fi_cq_readerr(rx) failed: ", fi_strerror(-errRc), " (rc=", errRc, ")");
+    }
+    char errBuf[512] = {};
+    auto const* errStr =
+        fi_cq_strerror(impl_->resources->rxCq(), err.prov_errno, err.err_data, errBuf, sizeof(errBuf));
+    THROW(CONN, Error, ErrorCode::SystemError,
+          "OFI RX CQ error: err=", err.err,
+          " prov_errno=", err.prov_errno,
+          " flags=", err.flags,
+          " op_context=", err.op_context,
+          " msg=", (errStr ? errStr : "unknown"));
+  }
+
+  checkOfiConn(static_cast<int>(rc), "fi_cq_read(rx)");
+  return false;
+#else
+  return false;
+#endif
+}
+
+bool OfiConnection::progressCompletionsOnce() {
+#if defined(MSCCLPP_USE_OFI)
+  if (!impl_ || !impl_->resources) {
+    THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
+  }
+
+  fi_cq_entry entries[8];
+  auto rc = fi_cq_read(impl_->resources->txCq(), entries, 8);
+
+  if (rc > 0) {
+    impl_->cqCompletionsSeen += static_cast<uint64_t>(rc);
+    for (ssize_t i = 0; i < rc; ++i) {
+      if (impl_->outstandingTx == 0) {
+        THROW(CONN, Error, ErrorCode::InternalError,
+              "OFI CQ returned a completion with no outstanding operations");
+      }
+      --impl_->outstandingTx;
+
+      if (entries[i].op_context != nullptr) {
+        auto* ctx = static_cast<Impl::CompletionContext*>(entries[i].op_context);
+        ctx->done = true;
+      }
+    }
+    DEBUG(CONN, "OfiConnection::progressCompletionsOnce: cq batch=", rc,
+         " cqCompletionsSeen=", impl_->cqCompletionsSeen,
+         " writesPostedNoCq=", impl_->writesPostedNoCq,
+         " writesPostedCq=", impl_->writesPostedCq,
+         " outstandingTx=", impl_->outstandingTx);
+    return true;
+  }
+
+  if (rc == -FI_EAGAIN) {
+    return false;
+  }
+
+  if (rc == -FI_EAVAIL) {
+    fi_cq_err_entry err = {};
+    auto errRc = fi_cq_readerr(impl_->resources->txCq(), &err, 0);
+    if (errRc < 0) {
+      THROW(CONN, Error, ErrorCode::SystemError,
+            "fi_cq_readerr failed: ", fi_strerror(-errRc), " (rc=", errRc, ")");
+    }
+
+    char errBuf[512] = {};
+    auto const* errStr =
+        fi_cq_strerror(impl_->resources->txCq(), err.prov_errno, err.err_data, errBuf, sizeof(errBuf));
+
+    THROW(CONN, Error, ErrorCode::SystemError,
+      "OFI CQ error: err=", err.err,
+      " prov_errno=", err.prov_errno,
+      " flags=", err.flags,
+      " op_context=", err.op_context,
+      " len=", err.len,
+      " olen=", err.olen,
+      " msg=", (errStr ? errStr : "unknown"));
+  }
+
+  checkOfiConn(static_cast<int>(rc), "fi_cq_read");
+  return false;
+#else
+  THROW(CONN, Error, ErrorCode::InvalidUsage,
+        "OFI transport requested but MSCCLPP was built without OFI support");
+#endif
+}
+
+void OfiConnection::waitForCompletions(int64_t timeoutUsec, void* targetContext, bool drainAll) {
+#if defined(MSCCLPP_USE_OFI)
+  if (!impl_ || !impl_->resources) {
+    THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
+  }
+
+  auto* target = static_cast<Impl::CompletionContext*>(targetContext);
+
+  auto const deadline =
+      (timeoutUsec < 0)
+          ? std::chrono::steady_clock::time_point::max()
+          : std::chrono::steady_clock::now() + std::chrono::microseconds(timeoutUsec);
+
+  auto done = [&]() -> bool {
+    if (drainAll) {
+      return impl_->outstandingTx == 0;
+    }
+    return target != nullptr && target->done;
+  };
+
+  while (!done()) {
+    if (progressCompletionsOnce()) {
+      continue;
+    }
+
+    if (timeoutUsec >= 0 && std::chrono::steady_clock::now() >= deadline) {
+      if (drainAll) {
+        THROW(CONN, Error, ErrorCode::Aborted,
+              "OfiConnection::flush timed out with outstandingTx=", impl_->outstandingTx);
+      } else {
+        THROW(CONN, Error, ErrorCode::Aborted,
+              "OfiConnection wait for targeted completion timed out");
+      }
+    }
+
+    std::this_thread::yield();
+  }
+#else
+  (void)timeoutUsec;
+  (void)targetContext;
+  (void)drainAll;
+  THROW(CONN, Error, ErrorCode::InvalidUsage,
+        "OFI transport requested but MSCCLPP was built without OFI support");
+#endif
+}
+
+std::unique_ptr<OfiMr const> OfiConnection::registerOfiMr(void* data, size_t size) const {
+#if defined(MSCCLPP_USE_OFI)
+  if (!impl_ || !impl_->resources) {
+    THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
+  }
+  return std::make_unique<OfiMr const>(*impl_->resources, data, size, classifyOfiMemory(data));
+#else
+  (void)data;
+  (void)size;
+  THROW(CONN, Error, ErrorCode::InvalidUsage,
+        "OFI transport requested but MSCCLPP was built without OFI support");
+#endif
 }
 
 }  // namespace mscclpp
