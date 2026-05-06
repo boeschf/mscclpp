@@ -59,9 +59,24 @@ static int resolve_num_proxy_services() {
   return 8;
 }
 
-Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes, bool low_latency_mode)
+static int resolve_num_local_ranks(int requested_num_local_ranks, int num_ranks) {
+  if (requested_num_local_ranks > 0) {
+    return requested_num_local_ranks;
+  }
+  if (const char* env = std::getenv("LOCAL_WORLD_SIZE")) {
+    int v = std::atoi(env);
+    if (v > 0) {
+      return v;
+    }
+  }
+  return std::min(num_ranks, NUM_MAX_NVL_PEERS);
+}
+
+Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_bytes, bool low_latency_mode,
+               int num_local_ranks)
     : rank(rank),
       num_ranks(num_ranks),
+      num_local_ranks(resolve_num_local_ranks(num_local_ranks, num_ranks)),
       num_nvl_bytes(num_nvl_bytes),
       num_rdma_bytes(num_rdma_bytes),
       low_latency_mode(low_latency_mode),
@@ -86,15 +101,18 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
                  (num_nvl_bytes <= std::numeric_limits<int>::max() or num_rdma_bytes == 0));
   EP_HOST_ASSERT(num_rdma_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and
                  (low_latency_mode or num_rdma_bytes <= std::numeric_limits<int>::max()));
+  EP_HOST_ASSERT(this->num_local_ranks > 0 && this->num_local_ranks <= NUM_MAX_NVL_PEERS);
   EP_HOST_ASSERT(0 <= rank and rank < num_ranks and
                  (num_ranks <= NUM_MAX_NVL_PEERS * NUM_MAX_RDMA_PEERS or low_latency_mode));
-  EP_HOST_ASSERT(num_ranks < NUM_MAX_NVL_PEERS or num_ranks % NUM_MAX_NVL_PEERS == 0);
-  if (num_rdma_bytes > 0) EP_HOST_ASSERT(num_ranks > NUM_MAX_NVL_PEERS or low_latency_mode);
+  EP_HOST_ASSERT(num_ranks < this->num_local_ranks || num_ranks % this->num_local_ranks == 0);
+  if (num_rdma_bytes > 0) EP_HOST_ASSERT(num_ranks > this->num_local_ranks || low_latency_mode);
 
   // Get ranks
   CUDA_CHECK(cudaGetDevice(&device_id));
-  rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
-  num_rdma_ranks = std::max(1, num_ranks / NUM_MAX_NVL_PEERS), num_nvl_ranks = std::min(num_ranks, NUM_MAX_NVL_PEERS);
+  rdma_rank = rank / this->num_local_ranks;
+  nvl_rank = rank % this->num_local_ranks;
+  num_rdma_ranks = std::max(1, num_ranks / this->num_local_ranks);
+  num_nvl_ranks = std::min(num_ranks, this->num_local_ranks);
 
   // Get device info
   cudaDeviceProp device_prop = {};
@@ -195,7 +213,7 @@ void Buffer::move_fifo_slots(int num_slots) { head = (head + num_ranks * num_slo
 
 bool Buffer::is_available() const { return available; }
 
-bool Buffer::is_internode_available() const { return is_available() and num_ranks > NUM_MAX_NVL_PEERS; }
+bool Buffer::is_internode_available() const { return is_available() and num_ranks > num_local_ranks; }
 
 int Buffer::get_num_rdma_ranks() const { return num_rdma_ranks; }
 
@@ -463,7 +481,7 @@ void Buffer::sync(const std::vector<int>& device_ids,
     // ------------------------------------------------------------------
     if (ll_ipc_only) {
       EP_HOST_ASSERT(num_ranks == num_nvl_ranks);
-      EP_HOST_ASSERT(num_ranks <= NUM_MAX_NVL_PEERS);
+      EP_HOST_ASSERT(num_ranks <= num_local_ranks);
 
       // 1. Exchange CUDA IPC handles for rdma_buffer_ptr via bootstrap.
       CUDA_CHECK(cudaIpcGetMemHandle(&rdma_ipc_handles[rank], rdma_buffer_ptr));
@@ -1074,7 +1092,8 @@ Buffer::internode_dispatch(
     internode::cached_notify(hidden_int4, num_scales, num_topk, num_topk, num_ranks, num_channels, 0, nullptr, nullptr,
                              nullptr, nullptr, rdma_buffer_ptr, config.num_max_rdma_chunked_recv_tokens,
                              buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens, task_fifo_ptrs_gpu, head, rank,
-                             comm_stream, config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
+                             comm_stream,
+                             config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks, num_local_ranks),
                              num_nvl_bytes, true, low_latency_mode, port_channel_handles_device_ptr.get(),
                              memory_channel_handles_device_ptr.get());
     move_fifo_slots(2);
@@ -1096,7 +1115,8 @@ Buffer::internode_dispatch(
         recv_rdma_rank_prefix_sum.data_ptr<int>(), gbl_channel_prefix_matrix.data_ptr<int>(),
         recv_gbl_rank_prefix_sum.data_ptr<int>(), rdma_buffer_ptr, config.num_max_rdma_chunked_recv_tokens,
         buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens, task_fifo_ptrs_gpu, head, rank, comm_stream,
-        config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks), num_nvl_bytes, low_latency_mode,
+        config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks, num_local_ranks), num_nvl_bytes,
+        low_latency_mode,
         port_channel_handles_device_ptr.get(), memory_channel_handles_device_ptr.get());
     move_fifo_slots(3);
 
@@ -1140,7 +1160,8 @@ Buffer::internode_dispatch(
         torch::empty({num_rdma_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
     recv_gbl_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
     send_rdma_head = torch::empty({num_tokens, num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
-    send_nvl_head = torch::empty({num_rdma_recv_tokens, NUM_MAX_NVL_PEERS}, dtype(torch::kInt32).device(torch::kCUDA));
+    send_nvl_head =
+        torch::empty({num_rdma_recv_tokens, num_local_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
   }
 
   int64_t* recv_topk_idx_ptr = nullptr;
@@ -1250,7 +1271,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
   EP_HOST_ASSERT(gbl_channel_prefix_matrix.size(0) == num_ranks and gbl_channel_prefix_matrix.size(1) == num_channels);
   EP_HOST_ASSERT(combined_rdma_head.dim() == 2 and combined_rdma_head.size(0) == num_combined_tokens and
                  combined_rdma_head.size(1) == num_rdma_ranks);
-  EP_HOST_ASSERT(combined_nvl_head.dim() == 2 and combined_nvl_head.size(1) == NUM_MAX_NVL_PEERS);
+  EP_HOST_ASSERT(combined_nvl_head.dim() == 2 and combined_nvl_head.size(1) == num_local_ranks);
 
   auto compute_stream = at::cuda::getCurrentCUDAStream();
   if (allocate_on_comm_stream) {
@@ -1286,7 +1307,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
       rdma_channel_prefix_matrix.data_ptr<int>(), rdma_rank_prefix_sum.data_ptr<int>(),
       combined_nvl_head.data_ptr<int>(), rdma_buffer_ptr, config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
       config.num_max_nvl_chunked_recv_tokens, task_fifo_ptrs_gpu, head, rank, comm_stream,
-      config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks), num_nvl_bytes, false, low_latency_mode,
+      config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks, num_local_ranks), num_nvl_bytes, false,
+      low_latency_mode,
       port_channel_handles_device_ptr.get(), memory_channel_handles_device_ptr.get());
   move_fifo_slots(2);
 

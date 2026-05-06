@@ -84,7 +84,18 @@ class Buffer:
         self.low_latency_mode = low_latency_mode
         self.num_qps_per_rank = num_qps_per_rank
 
-        self.runtime = _cpp.Buffer(self.rank, self.group_size, num_nvl_bytes, num_rdma_bytes, low_latency_mode)
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", "0"))
+        if local_world_size <= 0:
+            local_world_size = min(self.group_size, 8)
+
+        self.runtime = _cpp.Buffer(
+            self.rank,
+            self.group_size,
+            num_nvl_bytes,
+            num_rdma_bytes,
+            low_latency_mode,
+            local_world_size,
+        )
 
         # Exchange device IDs + IPC handles + (for RDMA) the MSCCL++ unique id.
         device_ids: List[Optional[int]] = [None] * self.group_size
@@ -165,8 +176,12 @@ class Buffer:
     def internode_combine(self, *args, **kwargs):
         return self.runtime.internode_combine(*args, **kwargs)
 
-    def clean_low_latency_buffer(self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int) -> None:
-        self.runtime.clean_low_latency_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
+    def clean_low_latency_buffer(
+        self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int
+    ) -> None:
+        self.runtime.clean_low_latency_buffer(
+            num_max_dispatch_tokens_per_rank, hidden, num_experts
+        )
 
     def low_latency_dispatch(self, *args, **kwargs):
         return self.runtime.low_latency_dispatch(*args, **kwargs)
@@ -174,8 +189,12 @@ class Buffer:
     def low_latency_combine(self, *args, **kwargs):
         return self.runtime.low_latency_combine(*args, **kwargs)
 
-    def get_next_low_latency_combine_buffer(self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int):
-        return self.runtime.get_next_low_latency_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
+    def get_next_low_latency_combine_buffer(
+        self, num_max_dispatch_tokens_per_rank: int, hidden: int, num_experts: int
+    ):
+        return self.runtime.get_next_low_latency_combine_buffer(
+            num_max_dispatch_tokens_per_rank, hidden, num_experts
+        )
 
     def get_local_buffer_tensor(
         self, dtype: torch.dtype, offset: int = 0, use_rdma_buffer: bool = False
@@ -188,6 +207,11 @@ class Buffer:
 
     @staticmethod
     def get_low_latency_rdma_size_hint(
-        num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int
+        num_max_dispatch_tokens_per_rank: int,
+        hidden: int,
+        num_ranks: int,
+        num_experts: int,
     ) -> int:
-        return _cpp.get_low_latency_rdma_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
+        return _cpp.get_low_latency_rdma_size_hint(
+            num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts
+        )
