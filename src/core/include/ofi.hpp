@@ -1,10 +1,20 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
 #ifndef MSCCLPP_OFI_HPP_
 #define MSCCLPP_OFI_HPP_
 
 #include <cstdint>
 #include <memory>
 #include <mscclpp/core.hpp>
-#include <vector>
+
+//
+#include "ofi_communicator.hpp"
+#include "ofi_controller.hpp"
+
+using rank_type = std::uint64_t;
+using tag_type = std::uint64_t;
+using request_callback_type = libfatbat::unique_function<void(rank_type, tag_type)>;
 
 // Forward declarations for libfabric types.
 struct fi_info;
@@ -20,36 +30,57 @@ namespace mscclpp {
 
 struct OfiEndpointWireInfo {
   uint32_t version = 1;
-  uint32_t flags = 0;
-  std::vector<uint8_t> addr;
-};
-
-struct OfiMrInfo {
-  uint64_t addr = 0;
-  uint64_t rkey = 0;
-  uint64_t size = 0;
-};
-
-enum class OfiHmemIface {
-  System,
-  Cuda,
-  Rocr
+  uint64_t rank = 0;
+  libfatbat::locality::locality_data addr;
 };
 
 struct OfiMemoryAttr {
-  OfiHmemIface iface = OfiHmemIface::System;
+  libfatbat::mem_Iface iface = libfatbat::mem_Iface::System;
   int device = -1;
   bool deviceOnly = false;
 };
 
+struct memregion_deleter {
+  void operator()(libfatbat::memory_region *r) {
+    if (r)
+     r->deregister();
+  }
+};
+
+using OfiMr = libfatbat::memory_region;
+using unique_memregion = std::unique_ptr<OfiMr , memregion_deleter>;
+
 OfiMemoryAttr classifyOfiMemory(void* data);
 
-class OfiCtx;
+class OfiCtx {
+ public:
+  explicit OfiCtx(EndpointConfig::Ofi const& config);
+  ~OfiCtx() { }; // closeAll(); }
+
+  OfiCtx(OfiCtx const&) = delete;
+  OfiCtx& operator=(OfiCtx const&) = delete;
+  OfiCtx(OfiCtx&&) = delete;
+  OfiCtx& operator=(OfiCtx&&) = delete;
+
+  ofi_controller* controller() { return controller_.get(); }
+
+  /// Exchange peer locality addresses once and insert them into the OFI address vector.
+  void setupPeerConnections();
+
+ private:
+  void closeAll() noexcept;
+
+  std::shared_ptr<ofi_controller> controller_;
+  EndpointConfig::Ofi config_;
+  mutable std::mutex peerAddrMutex_;
+  bool peerAddrsInitialized_ = false;
+};
+
 
 class OfiEndpointResources {
  public:
   OfiEndpointResources(OfiCtx& ctx, EndpointConfig const& config);
-  ~OfiEndpointResources() { closeAll(); }
+  ~OfiEndpointResources() { } //  closeAll(); }
 
   OfiEndpointResources(OfiEndpointResources const&) = delete;
   OfiEndpointResources& operator=(OfiEndpointResources const&) = delete;
@@ -58,77 +89,27 @@ class OfiEndpointResources {
   OfiEndpointResources& operator=(OfiEndpointResources&&) = delete;
 
   OfiCtx& ctx() const { return *ctx_; }
-  fid_ep* ep() const { return ep_; }
-  fid_av* av() const { return av_; }
-  fid_cq* txCq() const { return txCq_; }
-  fid_cq* rxCq() const { return rxCq_; }
-  fid_cntr* txCntr() const { return txCntr_; }
+  inline ofi_controller* controller() const { return ctx_->controller(); }
+  inline ofi_communicator* communicator() const { return comm_.get(); }
 
-  std::vector<uint8_t> const& address() const { return addr_; }
+
+  fid_ep* ep() const { return ctx_->controller()->get_rx_endpoint().get_ep(); }
+  fid_cq* txCq() const { return ctx_->controller()->get_tx_endpoint().get_tx_cq(); }
+  fid_cq* rxCq() const { return ctx_->controller()->get_rx_endpoint().get_rx_cq(); }
+
+  libfatbat::locality const& address() const { return ctx_->controller()->here(); }
   uint32_t flags() const { return flags_; }
-  bool supportsWriteData() const { return supportsWriteData_; }
+  bool supportsWriteData() const { return ctx_->controller()->supports_write_data(); }
 
  private:
   void closeAll() noexcept;
   void cacheAddress();
 
-  OfiCtx* ctx_ = nullptr;
-  fid_ep* ep_ = nullptr;
-  fid_av* av_ = nullptr;
-  fid_cq* txCq_ = nullptr;
-  fid_cq* rxCq_ = nullptr;
-  fid_cntr* txCntr_ = nullptr;
+  OfiCtx* ctx_;
+  std::shared_ptr<ofi_communicator> comm_;
 
-  std::vector<uint8_t> addr_;
+
   uint32_t flags_ = 0;
-  bool supportsWriteData_ = false;
-};
-
-class OfiMr {
- public:
-  OfiMr(OfiEndpointResources& epRes, void* data, size_t size, OfiMemoryAttr const& memAttr);
-  ~OfiMr() { close(); }
-
-  OfiMr(OfiMr const&) = delete;
-  OfiMr& operator=(OfiMr const&) = delete;
-  OfiMr(OfiMr&&) = delete;
-  OfiMr& operator=(OfiMr&&) = delete;
-
-  fid_mr* mr() const { return mr_; }
-  void* desc() const;
-  OfiMrInfo const& getInfo() const { return info_; }
-
- private:
-  void close() noexcept;
-
-  fid_mr* mr_ = nullptr;
-  OfiMrInfo info_{};
-};
-
-class OfiCtx {
- public:
-  explicit OfiCtx(EndpointConfig::Ofi const& config);
-  ~OfiCtx() { closeAll(); }
-
-  OfiCtx(OfiCtx const&) = delete;
-  OfiCtx& operator=(OfiCtx const&) = delete;
-  OfiCtx(OfiCtx&&) = delete;
-  OfiCtx& operator=(OfiCtx&&) = delete;
-
-  fi_info* info() const { return info_; }
-  fid_fabric* fabric() const { return fabric_; }
-  fid_domain* domain() const { return domain_; }
-  uint64_t mrMode() const { return mrMode_; }
-  uint64_t caps() const { return caps_; }
-
- private:
-  void closeAll() noexcept;
-
-  fi_info* info_ = nullptr;
-  fid_fabric* fabric_ = nullptr;
-  fid_domain* domain_ = nullptr;
-  uint64_t mrMode_ = 0;
-  uint64_t caps_ = 0;
 };
 
 }  // namespace mscclpp

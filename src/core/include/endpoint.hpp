@@ -52,7 +52,7 @@ namespace detail {
 
 inline void serialize(std::vector<char>& buf, const OfiEndpointWireInfo& ofi) {
   serialize(buf, ofi.version);
-  serialize(buf, ofi.flags);
+  serialize(buf, ofi.rank);
   serialize(buf, ofi.addr);
 }
 
@@ -71,7 +71,7 @@ inline void serialize(std::vector<char>& buf, const EndpointConfig& cfg) {
 
 inline std::vector<char>::const_iterator deserialize(const std::vector<char>::const_iterator& pos, OfiEndpointWireInfo& ofi) {
   auto cur = deserialize(pos, ofi.version);
-  cur = deserialize(cur, ofi.flags);
+  cur = deserialize(cur, ofi.rank);
   cur = deserialize(cur, ofi.addr);
   return cur;
 }

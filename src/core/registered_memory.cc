@@ -117,7 +117,7 @@ RegisteredMemory::Impl::Impl(void* data, size_t size, TransportFlags transports,
         DataType{
             /*ofiLocal=*/true,
             /*ofiMr=*/this->ofiMr.get(),
-            /*ofiMrInfo=*/this->ofiMr->getInfo()});
+            /*ofiMrInfo=*/this->ofiMr->get_info()});
     this->transportInfos.push_back(transportInfo);
 
     INFO(NET, "OFI mr for address ", data, " with size ", size, " is registered");

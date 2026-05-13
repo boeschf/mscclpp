@@ -473,6 +473,9 @@ struct EndpointConfig {
   struct Ofi {
     std::string provider;
     std::string domain;
+    // size_t num_Ranks;
+    // size_t my_Rank;
+    std::shared_ptr<Bootstrap> bootstrap;
   };
 
   /// Communication transport type (e.g., CudaIpc, IB0-IB7, Ethernet).

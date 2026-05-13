@@ -12,6 +12,7 @@
 #include <mscclpp/port_channel.hpp>
 #include <mscclpp/port_channel_device.hpp>
 #include <sstream>
+#include <thread>
 
 #define PORT_NUMBER "50505"
 
@@ -60,10 +61,10 @@ __global__ void bidirPutKernel(mscclpp::PortChannelDeviceHandle* devHandle, size
 
 void worker(int rank, int gpuId, const std::string& ipPort, mscclpp::Transport transport) {
   MSCCLPP_CUDATHROW(cudaSetDevice(gpuId));
-  const int myRank = rank;
-  const int remoteRank = myRank == 0 ? 1 : 0;
-  const int nRanks = 2;
-  const int iter = 1000;
+  const size_t myRank = rank;
+  const size_t remoteRank = myRank == 0 ? 1 : 0;
+  const size_t nRanks = 2;
+  const size_t iter = 1000;
   const size_t bufferBytes = 256 * 1024 * 1024;
 
   log("Rank ", myRank, " (GPU ", gpuId, "): Preparing for tests ...");
@@ -75,29 +76,34 @@ void worker(int rank, int gpuId, const std::string& ipPort, mscclpp::Transport t
   mscclpp::Communicator comm(bootstrap);
 
   log("Rank ", myRank, " (GPU ", gpuId, "): Connecting ...");
-  auto conn = comm.connect({transport, {mscclpp::DeviceType::GPU, gpuId}}, remoteRank).get();
+  auto conn =
+      comm.connect({transport, {mscclpp::DeviceType::GPU, gpuId}, {}, {}, {"", "", bootstrap}}, remoteRank).get();
 
   log("Rank ", myRank, " (GPU ", gpuId, "): Building Semaphore ...");
-  //auto sema = comm.buildSemaphore(conn, remoteRank).get();
+  // auto sema = comm.buildSemaphore(conn, remoteRank).get();
   auto sema = comm.buildSemaphore2(conn).get();
 
   log("Rank ", myRank, " (GPU ", gpuId, "): Registering Memory ...");
   mscclpp::GpuBuffer buffer(bufferBytes);
-  //mscclpp::RegisteredMemory localRegMem = comm.registerMemory(buffer.data(), buffer.bytes(), transport);
+  // mscclpp::RegisteredMemory localRegMem = comm.registerMemory(buffer.data(), buffer.bytes(), transport);
   mscclpp::RegisteredMemory localRegMem = comm.registerMemory(buffer.data(), buffer.bytes(), transport, conn);
 
   log("Rank ", myRank, " (GPU ", gpuId, "): Exchanging Memory ...");
-  //comm.sendMemory(localRegMem, remoteRank);
+  // comm.sendMemory(localRegMem, remoteRank);
   comm.sendMemory2(localRegMem);
-  //auto remoteRegMemFuture = comm.recvMemory(remoteRank);
+  // auto remoteRegMemFuture = comm.recvMemory(remoteRank);
   auto remoteRegMemFuture = comm.recvMemory2(conn);
   mscclpp::RegisteredMemory remoteRegMem = remoteRegMemFuture.get();
 
   log("Rank ", myRank, " (GPU ", gpuId, "): Setting up Proxy Service ...");
   mscclpp::ProxyService proxyService;
+  log("Rank ", myRank, " (GPU ", gpuId, "): Add semaphore ...");
   mscclpp::SemaphoreId semaId = proxyService.addSemaphore(sema);
+  log("Rank ", myRank, " (GPU ", gpuId, "): Add memory (local) ... ", localRegMem.data());
   mscclpp::MemoryId localMemId = proxyService.addMemory(localRegMem);
+  log("Rank ", myRank, " (GPU ", gpuId, "): Add memory (remote) ... ", remoteRegMem.data());
   mscclpp::MemoryId remoteMemId = proxyService.addMemory(remoteRegMem);
+  log("Rank ", myRank, " (GPU ", gpuId, "): PortChannel ...");
   mscclpp::PortChannel portChan = proxyService.portChannel(semaId, remoteMemId, localMemId);
 
   log("Rank ", myRank, " (GPU ", gpuId, "): Running Tests ...");
@@ -136,8 +142,9 @@ void worker(int rank, int gpuId, const std::string& ipPort, mscclpp::Transport t
       MSCCLPP_CUDATHROW(cudaGraphCreate(&graph, 0));
       MSCCLPP_CUDATHROW(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
 
-      for (int i = 0; i < iter; ++i) {
+      for (size_t i = 0; i < iter; ++i) {
         kernels[kernelId](copyBytes);
+        // std::this_thread::sleep_for(std::chrono::milliseconds(10000));
       }
 
       MSCCLPP_CUDATHROW(cudaStreamEndCapture(stream, &graph));

@@ -51,7 +51,7 @@ class BaseConnection {
   /// When false, the NIC writes directly to the semaphore's registered memory (e.g., via atomics).
   virtual bool isSignalForwarding() const { return false; }
 
-  virtual std::unique_ptr<OfiMr const> registerOfiMr(void* data, size_t size) const;
+  virtual unique_memregion registerOfiMr(void* data, size_t size) const;
 
   /// Progress transport-specific background work without blocking.
   virtual void progress() {}
@@ -208,7 +208,7 @@ class OfiConnection : public BaseConnection {
 
   void flush(int64_t timeoutUsec) override;
 
-  std::unique_ptr<OfiMr const> registerOfiMr(void* data, size_t size) const override;
+  unique_memregion registerOfiMr(void* data, size_t size) const override;
 
   void startSignalForwarding(std::shared_ptr<uint64_t> mem) override;
 
@@ -220,6 +220,7 @@ class OfiConnection : public BaseConnection {
 
  private:
   struct Impl;
+  void handleRemoteCqData(uint64_t value);
   bool progressInboundSignalsOnce();
   bool progressCompletionsOnce();
   void waitForCompletions(int64_t timeoutUsec, void* targetContext, bool drainAll);

@@ -2,6 +2,8 @@
 // Licensed under the MIT license.
 
 #include "connection.hpp"
+#include <memory>
+#include <stdexcept>
 
 #if defined(ENABLE_NPKIT)
 #include <mscclpp/npkit/npkit.hpp>
@@ -24,9 +26,6 @@
 #include "logger.hpp"
 #include "ofi.hpp"
 
-#if defined(MSCCLPP_USE_OFI)
-#include "ofi_wrapper.hpp"
-#endif
 
 namespace mscclpp {
 
@@ -62,7 +61,7 @@ MSCCLPP_API_CPP const Device& BaseConnection::localDevice() const { return local
 
 MSCCLPP_API_CPP int BaseConnection::getMaxWriteQueueSize() const { return maxWriteQueueSize_; }
 
-std::unique_ptr<const OfiMr> BaseConnection::registerOfiMr(void* data, size_t size) const {
+unique_memregion BaseConnection::registerOfiMr(void* data, size_t size) const {
   (void)data;
   (void)size;
   THROW(CONN, Error, ErrorCode::InvalidUsage, "This connection does not support endpoint-scoped OFI MR registration");
@@ -732,33 +731,18 @@ struct OfiConsumeGuard {
 }  // namespace
 
 struct OfiConnection::Impl {
-  struct CompletionContext {
-#if defined(MSCCLPP_USE_OFI)
-    fi_context _reserved = {};  // reserved for OFI completion context (must be first member)
-#endif  // defined(MSCCLPP_USE_OFI)
-    bool done = false;
-  };
-
   Impl() = default;
 
   std::unique_ptr<OfiEndpointResources> resources;  // owned by the connection after consume
 #if defined(MSCCLPP_USE_OFI)
   fi_addr_t peerAddr = FI_ADDR_UNSPEC;
 #endif  // defined(MSCCLPP_USE_OFI)
-  uint64_t outstandingTx = 0;
-  uint64_t postedWrites = 0;
-  uint64_t writesPostedNoCq = 0;
-  uint64_t writesPostedCq = 0;
-  uint64_t cqCompletionsSeen = 0;
   uint64_t rxCqCompletionsSeen = 0;
   uint64_t cntrCompletionsSeen = 0;
-  bool useWriteDataSignal = false;
-  bool preferInjectWriteData = false;
-  bool disableInjectWriteData = false;
   uint64_t remoteUpdateDstAddr = 0;
 
   std::unique_ptr<uint64_t> updateScratch;
-  std::unique_ptr<const OfiMr> updateScratchMr;
+  unique_memregion updateScratchMr;
 };
 
 OfiConnection::OfiConnection(std::shared_ptr<Context> context, Endpoint const& localEndpoint,
@@ -795,20 +779,16 @@ OfiConnection::OfiConnection(std::shared_ptr<Context> context, Endpoint const& l
 
   // While construction is in progress, the endpoint still temporarily owns the resources.
   OfiEndpointResources* localResources = localImpl.ofiResources_.get();
+  auto controller = localResources->controller();
 
-  int rc = fi_av_insert(localResources->av(),
-                        remoteImpl.ofiWireInfo_.addr.data(),
-                        1,
-                        &impl_->peerAddr,
-                        0,
-                        nullptr);
-  if (rc != 1) {
-    if (rc >= 0) {
-      THROW(CONN, Error, ErrorCode::SystemError,
-            "fi_av_insert inserted unexpected number of addresses: ", rc);
-    }
-    checkOfiConn(rc, "fi_av_insert");
+  impl_->peerAddr = static_cast<fi_addr_t>(remoteImpl.ofiWireInfo_.rank);
+  auto worldSize = static_cast<fi_addr_t>(localResources->communicator()->size());
+  if (impl_->peerAddr >= worldSize) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage,
+          "OFI peer fi_address out of range: peerAddr=", static_cast<uint64_t>(impl_->peerAddr),
+          " worldSize=", static_cast<uint64_t>(worldSize));
   }
+  INFO(CONN, "Using peer address index from wire rank: ", static_cast<uint64_t>(impl_->peerAddr));
 
   // Ownership transfer:
   // once the endpoint is consumed successfully, the connection becomes the
@@ -816,26 +796,30 @@ OfiConnection::OfiConnection(std::shared_ptr<Context> context, Endpoint const& l
   impl_->resources = std::move(localImpl.ofiResources_);
 
   const bool localWriteData = localResources->supportsWriteData();
-  const bool remoteWriteData = (remoteImpl.ofiWireInfo_.flags & kOfiEndpointFlagWriteData) != 0;
-  const bool cxiWriteDataEnabled = envEnabled("FI_CXI_ENABLE_WRITEDATA");
-  impl_->useWriteDataSignal = localWriteData && remoteWriteData && cxiWriteDataEnabled;
-  impl_->preferInjectWriteData = envEnabled("MSCCLPP_OFI_INJECT_WRITEDATA");
-
+  const bool remoteWriteData = localWriteData; // (remoteImpl.ofiWireInfo_.flags & kOfiEndpointFlagWriteData) != 0;
+  const std::string& ofiProvider = localEndpoint.config().ofi.provider;
+  impl_->resources->communicator()->configure_runtime_options(ofiProvider, localWriteData, remoteWriteData,
+                                                              envEnabled("MSCCLPP_OFI_INJECT_WRITEDATA"));
+  
   impl_->updateScratch = std::make_unique<uint64_t>(0);
-  impl_->updateScratchMr = std::make_unique<const OfiMr>(
-      *impl_->resources,
-      impl_->updateScratch.get(),
-      sizeof(uint64_t),
-      classifyOfiMemory(impl_->updateScratch.get()));
+
+  auto attr = classifyOfiMemory(impl_->updateScratch.get());
+  auto region = libfatbat::make_region(controller, impl_->updateScratch.get(), sizeof(uint64_t), attr.device);
+  impl_->updateScratchMr = unique_memregion(new libfatbat::memory_region(region), memregion_deleter());
 
   INFO(CONN, "OfiConnection created: local EP ", impl_->resources->ep(),
        ", peerAddr=", static_cast<uint64_t>(impl_->peerAddr),
        ", remoteAddrBytes=", remoteImpl.ofiWireInfo_.addr.size(),
        ", localWriteData=", localWriteData,
        ", remoteWriteData=", remoteWriteData,
-       ", cxiWriteDataEnabled=", cxiWriteDataEnabled,
-       ", useWriteDataSignal=", impl_->useWriteDataSignal,
-       ", preferInjectWriteData=", impl_->preferInjectWriteData);
+       ", provider=", ofiProvider,
+      ", useRelativeRemoteAddr=", controller->use_relative_remote_addr(),
+      ", useTxCounterFlush=", impl_->resources->communicator()->use_tx_counter_flush(),
+      ", useWriteDataSignal=", impl_->resources->communicator()->use_write_data_signal(),
+      ", preferInjectWriteData=", impl_->resources->communicator()->prefer_inject_writedata());
+
+  impl_->resources->controller()->set_remote_cq_data_callback(
+      [this](uint64_t value) { this->handleRemoteCqData(value); });
 
   consumeGuard.dismiss();
 #else
@@ -845,26 +829,68 @@ OfiConnection::OfiConnection(std::shared_ptr<Context> context, Endpoint const& l
 #endif
 }
 
-OfiConnection::~OfiConnection() = default;
+OfiConnection::~OfiConnection() {
+#if defined(MSCCLPP_USE_OFI)
+  if (impl_ && impl_->resources) {
+    impl_->resources->controller()->clear_remote_cq_data_callback();
+  }
+#endif
+}
+
+void OfiConnection::handleRemoteCqData(uint64_t value) {
+#if defined(MSCCLPP_USE_OFI)
+  if (!impl_) {
+    return;
+  }
+
+  auto* comm = impl_->resources->communicator();
+
+  ++impl_->rxCqCompletionsSeen;
+  value = comm->normalize_remote_cq_data(value);
+
+  if (impl_->remoteUpdateDstAddr == 0) {
+    return;
+  }
+
+  auto* dstPtr = reinterpret_cast<uint64_t*>(impl_->remoteUpdateDstAddr);
+  int dstGpuId = detail::gpuIdFromAddress(dstPtr);
+  int currentDevice = -1;
+  (void)cudaGetDevice(&currentDevice);
+  if (localEndpoint_.device().type == DeviceType::GPU && dstGpuId >= 0) {
+    CudaDeviceGuard deviceGuard(localEndpoint_.device().id);
+    MSCCLPP_CUTHROW(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(dstPtr), &value, sizeof(value)));
+  } else {
+    atomicStore(dstPtr, value, memoryOrderRelease);
+  }
+
+  DEBUG(CONN, "OfiConnection inbound signal: value=", value,
+        " dst=", dstPtr,
+        " dstGpuId=", dstGpuId,
+        " currentDevice=", currentDevice,
+        " rxCqCompletionsSeen=", impl_->rxCqCompletionsSeen);
+#endif
+}
 
 Transport OfiConnection::transport() const { return Transport::Ofi; }
 
 Transport OfiConnection::remoteTransport() const { return Transport::Ofi; }
 
 bool OfiConnection::isSignalForwarding() const {
+  INFO(CONN, "OfiConnection isSignalForwarding: ", "peerAddr=", static_cast<uint64_t>(impl_->peerAddr));
 #if defined(MSCCLPP_USE_OFI)
-  return impl_ && impl_->useWriteDataSignal;
+  return impl_ && impl_->resources && impl_->resources->communicator()->use_write_data_signal();
 #else
   return false;
 #endif
 }
 
 void OfiConnection::startSignalForwarding(std::shared_ptr<uint64_t> mem) {
+  INFO(CONN, "OfiConnection startSignalForwarding: ", "peerAddr=", static_cast<uint64_t>(impl_->peerAddr));
 #if defined(MSCCLPP_USE_OFI)
   if (!impl_ || !impl_->resources) {
     THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
   }
-  if (!impl_->useWriteDataSignal) {
+  if (!impl_->resources->communicator()->use_write_data_signal()) {
     return;
   }
   impl_->remoteUpdateDstAddr = reinterpret_cast<uint64_t>(mem.get());
@@ -877,6 +903,7 @@ void OfiConnection::startSignalForwarding(std::shared_ptr<uint64_t> mem) {
 }
 
 void OfiConnection::stopSignalForwarding() {
+  INFO(CONN, "OfiConnection stopSignalForwarding: ", "peerAddr=", static_cast<uint64_t>(impl_->peerAddr));
 #if defined(MSCCLPP_USE_OFI)
   if (!impl_) {
     return;
@@ -887,6 +914,7 @@ void OfiConnection::stopSignalForwarding() {
 }
 
 void OfiConnection::progress() {
+  // INFO(CONN, "OfiConnection progress: ", "peerAddr=", static_cast<uint64_t>(impl_->peerAddr));
 #if defined(MSCCLPP_USE_OFI)
   (void)progressInboundSignalsOnce();
 #endif
@@ -894,6 +922,8 @@ void OfiConnection::progress() {
 
 void OfiConnection::write(RegisteredMemory dst, uint64_t dstOffset, RegisteredMemory src, uint64_t srcOffset,
                           uint64_t size) {
+
+  INFO(CONN, "OfiConnection write: ", "peerAddr=", static_cast<uint64_t>(impl_->peerAddr));
 #if defined(MSCCLPP_USE_OFI)
   if (!impl_ || !impl_->resources) {
     THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
@@ -916,39 +946,36 @@ void OfiConnection::write(RegisteredMemory dst, uint64_t dstOffset, RegisteredMe
     THROW(CONN, Error, ErrorCode::InternalError, "Local OFI source memory is missing an OFI MR");
   }
 
-  auto localBuf = static_cast<void*>(static_cast<uint8_t*>(getImpl(src).data) + srcOffset);
-  auto remoteAddr = dstData.ofiMrInfo.addr + dstOffset;
-
-  for (;;) {
-    int rc = fi_write(impl_->resources->ep(),
-                      localBuf,
-                      static_cast<size_t>(size),
-                      srcData.ofiMr->desc(),
-                      impl_->peerAddr,
-                      remoteAddr,
-                      dstData.ofiMrInfo.rkey,
-                      /*context=*/nullptr);
-    if (rc == 0) {
-      break;
-    }
-    if (rc == -FI_EAGAIN) {
-      std::this_thread::yield();
-      continue;
-    }
-    checkOfiConn(rc, "fi_write");
+  const auto srcAttr = classifyOfiMemory(getImpl(src).data);
+  if (srcAttr.iface != libfatbat::mem_Iface::System && !impl_->resources->controller()->supports_hmem()) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage,
+          "OFI provider does not support FI_HMEM; GPU source memory is unsupported in OfiConnection::write");
   }
 
-  ++impl_->postedWrites;
-  ++impl_->writesPostedNoCq;
+  const auto dstAttr = classifyOfiMemory(getImpl(dst).data);
+  if (dstAttr.iface != libfatbat::mem_Iface::System && !impl_->resources->controller()->supports_hmem()) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage,
+          "OFI provider does not support FI_HMEM; GPU destination memory is unsupported in OfiConnection::write");
+  }
+
+  auto localBuf = static_cast<void*>(static_cast<uint8_t*>(getImpl(src).data) + srcOffset);
+  // CXI path uses MR-relative remote addresses when FI_MR_VIRT_ADDR is not requested.
+  auto* comm = impl_->resources->communicator();
+  auto remoteAddr = comm->remote_rma_addr_value(dstData.ofiMrInfo.addr, dstOffset);
+
+  comm->write_remote_raw(localBuf, static_cast<size_t>(size), srcData.ofiMr->get_local_key(), impl_->peerAddr,
+                         remoteAddr, dstData.ofiMrInfo.rkey, nullptr, []() {});
 
   DEBUG(CONN, "OfiConnection write: local=", localBuf,
        " remote=", reinterpret_cast<void*>(remoteAddr),
+      " remoteBase=", reinterpret_cast<void*>(dstData.ofiMrInfo.addr),
+      " remoteOffset=", dstOffset,
+      " useRelativeRemoteAddr=", impl_->resources->controller()->use_relative_remote_addr(),
        " size=", size,
        " rkey=", dstData.ofiMrInfo.rkey,
-       " outstandingTx=", impl_->outstandingTx,
-       " postedWrites=", impl_->postedWrites,
-       " writesPostedNoCq=", impl_->writesPostedNoCq,
-       " writesPostedCq=", impl_->writesPostedCq);
+       " postedWrites=", comm->posted_writes(),
+       " writesPostedNoCq=", comm->writes_posted_no_cq(),
+      " useWriteDataSignal=", comm->use_write_data_signal());
 #else
   (void)dst;
   (void)dstOffset;
@@ -961,6 +988,7 @@ void OfiConnection::write(RegisteredMemory dst, uint64_t dstOffset, RegisteredMe
 }
 
 void OfiConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint64_t* src, uint64_t newValue) {
+  INFO(CONN, "OfiConnection updateAndSync: ", "peerAddr=", static_cast<uint64_t>(impl_->peerAddr));
 #if defined(MSCCLPP_USE_OFI)
   if (!impl_ || !impl_->resources) {
     THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
@@ -979,132 +1007,111 @@ void OfiConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint
   uint64_t oldValue = *src;
   *src = newValue;
   *impl_->updateScratch = newValue;
+  auto* comm = impl_->resources->communicator();
+  auto remoteAddr = comm->remote_rma_addr_value(dstData.ofiMrInfo.addr, dstOffset);
+
+    DEBUG(CONN, "OfiConnection updateAndSync state: useWriteDataSignal=", comm->use_write_data_signal(),
+      " preferInjectWriteData=", comm->prefer_inject_writedata(),
+      " disableInjectWriteData=", comm->disable_inject_writedata(),
+      " remoteUpdateDstAddr=", reinterpret_cast<void*>(impl_->remoteUpdateDstAddr),
+      " oldValue=", oldValue,
+      " newValue=", newValue);
 
   flush(-1);
 
-  if (impl_->useWriteDataSignal) {
-    if (impl_->preferInjectWriteData && !impl_->disableInjectWriteData) {
-      for (;;) {
-        int rc = fi_inject_writedata(impl_->resources->ep(),
-                                     nullptr,
-                                     0,
-                                     newValue,
-                                     impl_->peerAddr,
-                                     dstData.ofiMrInfo.addr + dstOffset,
-                                     dstData.ofiMrInfo.rkey);
-        if (rc == 0) {
-          DEBUG(CONN, "OfiConnection updateAndSync(inject_writedata): value ", oldValue, " -> ", newValue,
-                " remote=", reinterpret_cast<void*>(dstData.ofiMrInfo.addr + dstOffset),
-                " rkey=", dstData.ofiMrInfo.rkey);
-          return;
-        }
+  if (comm->use_write_data_signal()) {
+    bool postedWriteData = false;
 
-        if (rc == -FI_EAGAIN) {
-          std::this_thread::yield();
-          continue;
-        }
-
-        if (rc == -FI_EOPNOTSUPP || rc == -FI_ENOSYS || rc == -FI_EINVAL) {
-          impl_->disableInjectWriteData = true;
-          WARN(CONN, "fi_inject_writedata unsupported, falling back to fi_writedata; rc=", rc);
-          break;
-        }
-
-        checkOfiConn(rc, "fi_inject_writedata(updateAndSync)");
-      }
-    }
-
-    for (;;) {
-      int rc = fi_writedata(impl_->resources->ep(),
-                            nullptr,
-                            0,
-                            nullptr,
-                            newValue,
-                            impl_->peerAddr,
-                            dstData.ofiMrInfo.addr + dstOffset,
-                            dstData.ofiMrInfo.rkey,
-                            nullptr);
-      if (rc == 0) {
-        ++impl_->postedWrites;
-        ++impl_->writesPostedNoCq;
-        break;
-      }
-
-      if (rc == -FI_EAGAIN) {
-        std::this_thread::yield();
-        continue;
-      }
-
-      if (rc == -FI_EOPNOTSUPP || rc == -FI_ENOSYS || rc == -FI_EINVAL) {
-        THROW(CONN, Error, ErrorCode::SystemError,
-              "fi_writedata unsupported while OFI signal forwarding is enabled; rc=", rc);
-      }
-
-      checkOfiConn(rc, "fi_writedata(updateAndSync)");
-    }
-
-    DEBUG(CONN, "OfiConnection updateAndSync(writedata): value ", oldValue, " -> ", newValue,
-          " remote=", reinterpret_cast<void*>(dstData.ofiMrInfo.addr + dstOffset),
+    DEBUG(CONN, "OfiConnection updateAndSync: posting signal update to peerAddr=", static_cast<uint64_t>(impl_->peerAddr),
+          " remote=", reinterpret_cast<void*>(remoteAddr),
+          " remoteBase=", reinterpret_cast<void*>(dstData.ofiMrInfo.addr),
+          " remoteOffset=", dstOffset,
+          " useRelativeRemoteAddr=", impl_->resources->controller()->use_relative_remote_addr(),
           " rkey=", dstData.ofiMrInfo.rkey,
-          " postedWrites=", impl_->postedWrites,
-          " writesPostedNoCq=", impl_->writesPostedNoCq,
-          " cntrCompletionsSeen=", impl_->cntrCompletionsSeen);
+          " value=", newValue);
 
-    flush(5 * 1000 * 1000);
-    return;
-  }
+    int signalRc = 0;
+    auto signalResult = comm->post_update_signal(
+      impl_->updateScratch.get(), sizeof(uint64_t), impl_->updateScratchMr->get_local_key(),
+      impl_->peerAddr, remoteAddr, dstData.ofiMrInfo.rkey, newValue,
+        /*fail_if_unsupported=*/impl_->remoteUpdateDstAddr != 0,
+        [&postedWriteData]() { postedWriteData = true; }, &signalRc);
 
-  Impl::CompletionContext op{};
-
-  iovec localIov = {};
-  localIov.iov_base = impl_->updateScratch.get();
-  localIov.iov_len = sizeof(uint64_t);
-
-  fi_rma_iov remoteIov = {};
-  remoteIov.addr = dstData.ofiMrInfo.addr + dstOffset;
-  remoteIov.len = sizeof(uint64_t);
-  remoteIov.key = dstData.ofiMrInfo.rkey;
-
-  void* descs[1] = {impl_->updateScratchMr->desc()};
-
-  fi_msg_rma msg = {};
-  msg.msg_iov = &localIov;
-  msg.desc = descs;
-  msg.iov_count = 1;
-  msg.addr = impl_->peerAddr;
-  msg.rma_iov = &remoteIov;
-  msg.rma_iov_count = 1;
-  msg.context = &op;
-  msg.data = 0;
-
-  for (;;) {
-    int rc = fi_writemsg(impl_->resources->ep(), &msg, FI_COMPLETION);
-    if (rc == 0) {
-      ++impl_->outstandingTx;
-      ++impl_->writesPostedCq;
-      break;
-    }
-
-    if (rc == -FI_EAGAIN) {
-      if (!progressCompletionsOnce()) {
-        std::this_thread::yield();
+    if (signalResult == ofi_communicator::update_signal_result::error) {
+      if ((signalRc == -FI_EOPNOTSUPP || signalRc == -FI_ENOSYS || signalRc == -FI_EINVAL) &&
+          impl_->remoteUpdateDstAddr != 0) {
+        THROW(CONN, Error, ErrorCode::SystemError,
+              "fi_writedata unsupported after OFI signal forwarding has been initialized; "
+              "cannot safely fall back to fi_write without risking token forwarding mismatch/hang. "
+              "Disable FI_CXI_ENABLE_WRITEDATA or ensure provider/runtime supports fi_writedata. rc=",
+              signalRc);
       }
-      continue;
+      checkOfiConn(signalRc, "ofi_communicator::post_update_signal(updateAndSync)");
     }
 
-    checkOfiConn(rc, "fi_writemsg(updateAndSync)");
+    if (signalResult == ofi_communicator::update_signal_result::posted) {
+      DEBUG(CONN, "OfiConnection XXXX updateAndSync(writedata): value ", oldValue, " -> ", newValue,
+            " remote=", reinterpret_cast<void*>(remoteAddr),
+            " remoteBase=", reinterpret_cast<void*>(dstData.ofiMrInfo.addr),
+            " remoteOffset=", dstOffset,
+            " useRelativeRemoteAddr=", impl_->resources->controller()->use_relative_remote_addr(),
+            " rkey=", dstData.ofiMrInfo.rkey,
+            " postedWrites=", comm->posted_writes(),
+            " writesPostedNoCq=", comm->writes_posted_no_cq(),
+            " cntrCompletionsSeen=", impl_->cntrCompletionsSeen);
+
+      try {
+        flush(5 * 1000 * 1000);
+        return;
+      } catch (const Error& e) {
+        if (postedWriteData) {
+          comm->rollback_write_posted_no_cq();
+        }
+        WARN(CONN,
+             "Writedata path failed in updateAndSync, disabling useWriteDataSignal and falling back to fi_write. Reason: ",
+             e.what());
+        comm->disable_write_data_signal();
+      }
+    } else if (signalResult == ofi_communicator::update_signal_result::fallback_to_write) {
+      WARN(CONN,
+           "fi_writedata unsupported while OFI signal forwarding is enabled; disabling writedata signaling and falling back to fi_write.");
+    }
   }
 
-  DEBUG(CONN, "OfiConnection updateAndSync: value ", oldValue, " -> ", newValue,
-       " remote=", reinterpret_cast<void*>(remoteIov.addr),
-       " rkey=", remoteIov.key,
-       " outstandingTx=", impl_->outstandingTx,
-       " writesPostedNoCq=", impl_->writesPostedNoCq,
-       " writesPostedCq=", impl_->writesPostedCq,
-       " cqCompletionsSeen=", impl_->cqCompletionsSeen,
+  if (!comm->use_tx_counter_flush()) {
+    int rc = comm->inject_write_raw(impl_->updateScratch.get(), sizeof(uint64_t), impl_->peerAddr, remoteAddr,
+                    dstData.ofiMrInfo.rkey, []() {});
+    if (rc == 0) {
+      DEBUG(CONN, "OfiConnection ZZZZ updateAndSync(inject-write): value ", oldValue, " -> ", newValue,
+            " remote=", reinterpret_cast<void*>(remoteAddr),
+            " remoteBase=", reinterpret_cast<void*>(dstData.ofiMrInfo.addr),
+            " remoteOffset=", dstOffset,
+            " useRelativeRemoteAddr=", impl_->resources->controller()->use_relative_remote_addr(),
+            " rkey=", dstData.ofiMrInfo.rkey,
+            " useTxCounterFlush=", comm->use_tx_counter_flush());
+      return;
+    }
+    if (rc != -FI_EOPNOTSUPP && rc != -FI_ENOSYS && rc != -FI_EINVAL) {
+      checkOfiConn(rc, "fi_inject_write(updateAndSync)");
+    }
+  }
+
+  comm->write_remote_raw(impl_->updateScratch.get(), sizeof(uint64_t), impl_->updateScratchMr->get_local_key(),
+                         impl_->peerAddr, remoteAddr, dstData.ofiMrInfo.rkey, nullptr, []() {});
+
+  DEBUG(CONN, "OfiConnection YYYY updateAndSync(fallback-write): value ", oldValue, " -> ", newValue,
+       " remote=", reinterpret_cast<void*>(remoteAddr),
+       " remoteBase=", reinterpret_cast<void*>(dstData.ofiMrInfo.addr),
+       " remoteOffset=", dstOffset,
+       " useRelativeRemoteAddr=", impl_->resources->controller()->use_relative_remote_addr(),
+       " rkey=", dstData.ofiMrInfo.rkey,
+       " postedWrites=", comm->posted_writes(),
+      " writesPostedNoCq=", comm->writes_posted_no_cq(),
        " cntrCompletionsSeen=", impl_->cntrCompletionsSeen);
 
-  waitForCompletions(5 * 1000 * 1000, &op, /*drainAll=*/false);
+  if (comm->use_tx_counter_flush()) {
+    flush(5 * 1000 * 1000);
+  }
 #else
   (void)dst;
   (void)dstOffset;
@@ -1114,41 +1121,39 @@ void OfiConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint
         "OFI transport requested but MSCCLPP was built without OFI support");
 #endif
 }
+
 void OfiConnection::flush(int64_t timeoutUsec) {
+  INFO(CONN, "OfiConnection flush: ", "peerAddr=", static_cast<uint64_t>(impl_->peerAddr));
 #if defined(MSCCLPP_USE_OFI)
   if (!impl_ || !impl_->resources) {
     THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
   }
 
-  const uint64_t target = impl_->postedWrites;
+    auto* comm = impl_->resources->communicator();
+    const uint64_t target = comm->posted_writes();
+  DEBUG(CONN, "OfiConnection::flush enter: target=", target,
+      " postedWrites=", comm->posted_writes(),
+      " writesPostedNoCq=", comm->writes_posted_no_cq(),
+       " cntrCompletionsSeen=", impl_->cntrCompletionsSeen,
+     " remoteSignalsSeen=", comm->inbound_signals_seen(),
+       " timeoutUsec=", timeoutUsec);
   if (target == 0) {
     return;
   }
 
-  const auto deadline =
-      (timeoutUsec < 0)
-          ? std::chrono::steady_clock::time_point::max()
-          : std::chrono::steady_clock::now() + std::chrono::microseconds(timeoutUsec);
-
-  while (true) {
-    const auto completed = fi_cntr_read(impl_->resources->txCntr());
-    impl_->cntrCompletionsSeen = completed;
-    if (completed >= target) {
-      break;
-    }
-    if (timeoutUsec >= 0 && std::chrono::steady_clock::now() >= deadline) {
-      THROW(CONN, Error, ErrorCode::Aborted,
-            "OfiConnection::flush timed out waiting for write counter");
-    }
-    std::this_thread::yield();
+  try {
+    comm->wait_for_write_completions(timeoutUsec);
+  } catch (std::runtime_error const&) {
+    THROW(CONN, Error, ErrorCode::Aborted,
+          "OfiConnection::flush timed out waiting for write counter");
   }
 
-  DEBUG(CONN, "OfiConnection::flush: postedWrites=", impl_->postedWrites,
-       " writesPostedNoCq=", impl_->writesPostedNoCq,
-       " writesPostedCq=", impl_->writesPostedCq,
+  impl_->cntrCompletionsSeen = impl_->resources->controller()->get_tx_counter_value();
+
+  DEBUG(CONN, "OfiConnection::flush: postedWrites=", comm->posted_writes(),
+      " writesPostedNoCq=", comm->writes_posted_no_cq(),
        " cntrCompletionsSeen=", impl_->cntrCompletionsSeen,
-       " cqCompletionsSeen=", impl_->cqCompletionsSeen,
-       " outstandingTx=", impl_->outstandingTx);
+      " remoteSignalsSeen=", comm->inbound_signals_seen());
 #else
   (void)timeoutUsec;
   THROW(CONN, Error, ErrorCode::InvalidUsage,
@@ -1157,130 +1162,34 @@ void OfiConnection::flush(int64_t timeoutUsec) {
 }
 
 bool OfiConnection::progressInboundSignalsOnce() {
+  // INFO(CONN, "OfiConnection progressInboundSignalsOnce: ", "peerAddr=", static_cast<uint64_t>(impl_->peerAddr));
 #if defined(MSCCLPP_USE_OFI)
   if (!impl_ || !impl_->resources) {
     THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
   }
-  if (impl_->remoteUpdateDstAddr == 0) {
-    return false;
-  }
-
-  fi_cq_data_entry entries[8];
-  auto rc = fi_cq_read(impl_->resources->rxCq(), entries, 8);
-  if (rc > 0) {
-    impl_->rxCqCompletionsSeen += static_cast<uint64_t>(rc);
-    for (ssize_t i = 0; i < rc; ++i) {
-      if ((entries[i].flags & FI_REMOTE_CQ_DATA) == 0) {
-        continue;
-      }
-      uint64_t value = entries[i].data;
-      auto* dstPtr = reinterpret_cast<uint64_t*>(impl_->remoteUpdateDstAddr);
-      int dstGpuId = detail::gpuIdFromAddress(dstPtr);
-      int currentDevice = -1;
-      (void)cudaGetDevice(&currentDevice);
-      if (localDevice().type == DeviceType::GPU && dstGpuId >= 0) {
-        CudaDeviceGuard deviceGuard(localDevice().id);
-        MSCCLPP_CUTHROW(cuMemcpyHtoD(reinterpret_cast<CUdeviceptr>(dstPtr), &value, sizeof(value)));
-      } else {
-        atomicStore(dstPtr, value, memoryOrderRelease);
-      }
-      DEBUG(CONN, "OfiConnection inbound signal: value=", value,
-           " dst=", dstPtr,
-           " dstGpuId=", dstGpuId,
-           " currentDevice=", currentDevice,
-           " rxCqCompletionsSeen=", impl_->rxCqCompletionsSeen);
-    }
-    return true;
-  }
-
-  if (rc == -FI_EAGAIN) {
-    return false;
-  }
-
-  if (rc == -FI_EAVAIL) {
-    fi_cq_err_entry err = {};
-    auto errRc = fi_cq_readerr(impl_->resources->rxCq(), &err, 0);
-    if (errRc < 0) {
-      THROW(CONN, Error, ErrorCode::SystemError,
-            "fi_cq_readerr(rx) failed: ", fi_strerror(-errRc), " (rc=", errRc, ")");
-    }
-    char errBuf[512] = {};
-    auto const* errStr =
-        fi_cq_strerror(impl_->resources->rxCq(), err.prov_errno, err.err_data, errBuf, sizeof(errBuf));
-    THROW(CONN, Error, ErrorCode::SystemError,
-          "OFI RX CQ error: err=", err.err,
-          " prov_errno=", err.prov_errno,
-          " flags=", err.flags,
-          " op_context=", err.op_context,
-          " msg=", (errStr ? errStr : "unknown"));
-  }
-
-  checkOfiConn(static_cast<int>(rc), "fi_cq_read(rx)");
-  return false;
+  auto* comm = impl_->resources->communicator();
+  auto before = comm->inbound_signals_seen();
+  impl_->resources->communicator()->progress();
+  auto after = comm->inbound_signals_seen();
+  return after > before;
 #else
   return false;
 #endif
 }
 
 bool OfiConnection::progressCompletionsOnce() {
+  // INFO(CONN, "OfiConnection progressCompletionsOnce: ", "peerAddr=", static_cast<uint64_t>(impl_->peerAddr));
 #if defined(MSCCLPP_USE_OFI)
   if (!impl_ || !impl_->resources) {
     THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
   }
 
-  fi_cq_entry entries[8];
-  auto rc = fi_cq_read(impl_->resources->txCq(), entries, 8);
-
-  if (rc > 0) {
-    impl_->cqCompletionsSeen += static_cast<uint64_t>(rc);
-    for (ssize_t i = 0; i < rc; ++i) {
-      if (impl_->outstandingTx == 0) {
-        THROW(CONN, Error, ErrorCode::InternalError,
-              "OFI CQ returned a completion with no outstanding operations");
-      }
-      --impl_->outstandingTx;
-
-      if (entries[i].op_context != nullptr) {
-        auto* ctx = static_cast<Impl::CompletionContext*>(entries[i].op_context);
-        ctx->done = true;
-      }
-    }
-    DEBUG(CONN, "OfiConnection::progressCompletionsOnce: cq batch=", rc,
-         " cqCompletionsSeen=", impl_->cqCompletionsSeen,
-         " writesPostedNoCq=", impl_->writesPostedNoCq,
-         " writesPostedCq=", impl_->writesPostedCq,
-         " outstandingTx=", impl_->outstandingTx);
-    return true;
-  }
-
-  if (rc == -FI_EAGAIN) {
-    return false;
-  }
-
-  if (rc == -FI_EAVAIL) {
-    fi_cq_err_entry err = {};
-    auto errRc = fi_cq_readerr(impl_->resources->txCq(), &err, 0);
-    if (errRc < 0) {
-      THROW(CONN, Error, ErrorCode::SystemError,
-            "fi_cq_readerr failed: ", fi_strerror(-errRc), " (rc=", errRc, ")");
-    }
-
-    char errBuf[512] = {};
-    auto const* errStr =
-        fi_cq_strerror(impl_->resources->txCq(), err.prov_errno, err.err_data, errBuf, sizeof(errBuf));
-
-    THROW(CONN, Error, ErrorCode::SystemError,
-      "OFI CQ error: err=", err.err,
-      " prov_errno=", err.prov_errno,
-      " flags=", err.flags,
-      " op_context=", err.op_context,
-      " len=", err.len,
-      " olen=", err.olen,
-      " msg=", (errStr ? errStr : "unknown"));
-  }
-
-  checkOfiConn(static_cast<int>(rc), "fi_cq_read");
-  return false;
+  auto beforeWrites = static_cast<uint64_t>(impl_->resources->controller()->writes_complete_);
+  auto beforeRecvs = static_cast<uint64_t>(impl_->resources->controller()->recvs_complete_);
+  impl_->resources->communicator()->progress();
+  auto afterWrites = static_cast<uint64_t>(impl_->resources->controller()->writes_complete_);
+  auto afterRecvs = static_cast<uint64_t>(impl_->resources->controller()->recvs_complete_);
+  return (afterWrites > beforeWrites) || (afterRecvs > beforeRecvs);
 #else
   THROW(CONN, Error, ErrorCode::InvalidUsage,
         "OFI transport requested but MSCCLPP was built without OFI support");
@@ -1288,12 +1197,13 @@ bool OfiConnection::progressCompletionsOnce() {
 }
 
 void OfiConnection::waitForCompletions(int64_t timeoutUsec, void* targetContext, bool drainAll) {
+  INFO(CONN, "OfiConnection waitForCompletions: ", "peerAddr=", static_cast<uint64_t>(impl_->peerAddr));
 #if defined(MSCCLPP_USE_OFI)
   if (!impl_ || !impl_->resources) {
     THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
   }
 
-  auto* target = static_cast<Impl::CompletionContext*>(targetContext);
+  auto* target = static_cast<std::atomic<bool>*>(targetContext);
 
   auto const deadline =
       (timeoutUsec < 0)
@@ -1302,9 +1212,10 @@ void OfiConnection::waitForCompletions(int64_t timeoutUsec, void* targetContext,
 
   auto done = [&]() -> bool {
     if (drainAll) {
-      return impl_->outstandingTx == 0;
+      return static_cast<uint64_t>(impl_->resources->controller()->get_tx_counter_value()) >=
+             impl_->resources->communicator()->posted_writes();
     }
-    return target != nullptr && target->done;
+    return target != nullptr && target->load(std::memory_order_acquire);
   };
 
   while (!done()) {
@@ -1315,7 +1226,7 @@ void OfiConnection::waitForCompletions(int64_t timeoutUsec, void* targetContext,
     if (timeoutUsec >= 0 && std::chrono::steady_clock::now() >= deadline) {
       if (drainAll) {
         THROW(CONN, Error, ErrorCode::Aborted,
-              "OfiConnection::flush timed out with outstandingTx=", impl_->outstandingTx);
+              "OfiConnection::flush timed out with pending writes");
       } else {
         THROW(CONN, Error, ErrorCode::Aborted,
               "OfiConnection wait for targeted completion timed out");
@@ -1333,12 +1244,20 @@ void OfiConnection::waitForCompletions(int64_t timeoutUsec, void* targetContext,
 #endif
 }
 
-std::unique_ptr<OfiMr const> OfiConnection::registerOfiMr(void* data, size_t size) const {
+unique_memregion OfiConnection::registerOfiMr(void* data, size_t size) const {
+  INFO(CONN, "OfiConnection registerOfiMr: ", "peerAddr=", static_cast<uint64_t>(impl_->peerAddr));
 #if defined(MSCCLPP_USE_OFI)
   if (!impl_ || !impl_->resources) {
     THROW(CONN, Error, ErrorCode::InternalError, "OfiConnection is not initialized");
   }
-  return std::make_unique<OfiMr const>(*impl_->resources, data, size, classifyOfiMemory(data));
+  auto memAttr = classifyOfiMemory(data);
+  if (memAttr.iface != libfatbat::mem_Iface::System && !impl_->resources->controller()->supports_hmem()) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage,
+          "OFI provider does not support FI_HMEM; cannot register GPU memory for OFI transport");
+  }
+
+  auto reg = libfatbat::make_region(impl_->resources->controller(), data, size, memAttr.device);
+  return unique_memregion(new libfatbat::memory_region(reg), memregion_deleter());
 #else
   (void)data;
   (void)size;

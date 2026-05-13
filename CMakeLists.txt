@@ -41,7 +41,7 @@ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/include/mscclpp/version.hpp.in"
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
 # Options
-option(MSCCLPP_ENABLE_TRACE "Enable tracing" OFF)
+option(MSCCLPP_ENABLE_TRACE "Enable tracing" ON)
 option(MSCCLPP_BUILD_TESTS "Build tests" OFF)
 option(MSCCLPP_BUILD_PYTHON_BINDINGS "Build Python bindings" ON)
 option(MSCCLPP_BUILD_EXT_NCCL "Build NCCL interfaces" ON)
@@ -236,35 +236,37 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 
 if(MSCCLPP_USE_IB)
-    find_package(IBVerbs)
-    if(NOT IBVERBS_FOUND)
-        message(FATAL_ERROR "IBVerbs not found. Install libibverbs-dev or rdma-core-devel. If you want to disable InfiniBand, add `-DMSCCLPP_USE_IB=OFF` in your cmake command.")
-    endif()
-    find_package(MLX5)
-    if(MLX5_FOUND)
-        message(STATUS "MLX5 Direct Verbs found: ${MLX5_LIBRARIES}")
-    else()
-        message(STATUS "MLX5 Direct Verbs not found, mlx5dv optimizations disabled")
-    endif()
+  find_package(IBVerbs)
+  if(NOT IBVERBS_FOUND)
+    message(
+      FATAL_ERROR
+        "IBVerbs not found. Install libibverbs-dev or rdma-core-devel. If you want to disable InfiniBand, add `-DMSCCLPP_USE_IB=OFF` in your cmake command."
+    )
+  endif()
+  find_package(MLX5)
+  if(MLX5_FOUND)
+    message(STATUS "MLX5 Direct Verbs found: ${MLX5_LIBRARIES}")
+  else()
+    message(STATUS "MLX5 Direct Verbs not found, mlx5dv optimizations disabled")
+  endif()
 endif()
-if(MSCCLPP_USE_OFI)
-  find_package(Libfabric REQUIRED)
-endif()
+
 find_package(NUMA REQUIRED)
 find_package(Threads REQUIRED)
 
-option(MSCCLPP_USE_GDRCOPY "Use GDRCopy for direct GPU memory access from host." ON)
+option(MSCCLPP_USE_GDRCOPY
+       "Use GDRCopy for direct GPU memory access from host." ON)
 if(MSCCLPP_USE_ROCM)
-    set(MSCCLPP_USE_GDRCOPY OFF)
+  set(MSCCLPP_USE_GDRCOPY OFF)
 endif()
 if(MSCCLPP_USE_GDRCOPY)
-    find_package(GDRCopy)
-    if(NOT GDRCOPY_FOUND)
-        message(STATUS "GDRCopy not found, disabling GDRCopy support")
-        set(MSCCLPP_USE_GDRCOPY OFF)
-    else()
-        message(STATUS "GDRCopy found: ${GDRCOPY_LIBRARIES}")
-    endif()
+  find_package(GDRCopy)
+  if(NOT GDRCOPY_FOUND)
+    message(STATUS "GDRCopy not found, disabling GDRCopy support")
+    set(MSCCLPP_USE_GDRCOPY OFF)
+  else()
+    message(STATUS "GDRCopy found: ${GDRCOPY_LIBRARIES}")
+  endif()
 endif()
 
 include(FetchContent)
@@ -273,6 +275,24 @@ FetchContent_Declare(
   GIT_REPOSITORY https://github.com/nlohmann/json.git
   GIT_TAG v3.12.0)
 FetchContent_MakeAvailable(json)
+
+if(MSCCLPP_USE_OFI)
+  # ------------------------------------------------------------------------------
+  # libFatbat
+  # ------------------------------------------------------------------------------
+  if(EXISTS ${PROJECT_SOURCE_DIR}/ext/libfatbat)
+    set(FETCHCONTENT_SOURCE_DIR_LIBFATBAT ${PROJECT_SOURCE_DIR}/ext/libfatbat)
+  endif()
+  FetchContent_Declare(
+    libFatbat
+    GIT_REPOSITORY "https://github.com/biddisco/libfatbat.git"
+    GIT_TAG "develop")
+  FetchContent_MakeAvailable(libFatbat)
+  message(
+    STATUS
+      "✅ libFatbat building: (${libFatbat_VERSION}) from ${libFatbat_SOURCE_DIR} in ${libFatbat_BINARY_DIR}"
+  )
+endif()
 
 if("${INSTALL_PREFIX}" STREQUAL "")
   set(INSTALL_PREFIX "./")

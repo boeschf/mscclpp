@@ -54,7 +54,6 @@ struct Context::Impl {
   IbCtx* getIbContext(Transport ibTransport);
 
   void bindOfiConfig(EndpointConfig::Ofi const& ofiConfig);
-  //std::unique_ptr<const OfiMr> registerOfiMr(void* data, size_t size);
   std::unique_ptr<OfiEndpointResources> createOfiEndpointResources(EndpointConfig const& config);
 
   std::shared_ptr<uint64_t> getToken();

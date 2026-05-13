@@ -8,11 +8,6 @@ if(NOT MSCCLPP_USE_IB)
     ${CMAKE_CURRENT_SOURCE_DIR}/ibverbs_wrapper.cc
   )
 endif()
-if(NOT MSCCLPP_USE_OFI)
-  list(REMOVE_ITEM SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/ofi_wrapper.cc
-  )
-endif()
 
 # Handle ROCm specific source property
 if(MSCCLPP_USE_ROCM)
@@ -52,7 +47,7 @@ if(MSCCLPP_USE_GDRCOPY)
 endif()
 
 if(MSCCLPP_USE_OFI)
-    target_link_libraries(mscclpp_obj PRIVATE Libfabric::Libfabric)
+    target_link_libraries(mscclpp_obj PRIVATE libfatbat)
     target_compile_definitions(mscclpp_obj PUBLIC MSCCLPP_USE_OFI)
 endif()
 

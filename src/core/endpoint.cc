@@ -78,14 +78,17 @@ Endpoint::Impl::Impl(const EndpointConfig& config, Context::Impl& contextImpl)
         config_.ofi.domain = "cxi" + std::to_string(config_.device.id);
       }
       INFO(NET, "Endpoint OFI config: provider=", config_.ofi.provider, " domain=", config_.ofi.domain);
-      contextImpl.bindOfiConfig(config_.ofi);
+    config_.ofi.bootstrap = config_.ofi.bootstrap;
+
+    contextImpl.bindOfiConfig(config_.ofi);
       if (config_.maxWriteQueueSize <= 0) {
         config_.maxWriteQueueSize = 1024;
       }
       ofiResources_ = contextImpl.createOfiEndpointResources(config_);
-      ofiWireInfo_.flags = ofiResources_->flags();
-      ofiWireInfo_.addr = ofiResources_->address();
-      INFO(NET, "Endpoint OFI wire info: flags=", ofiWireInfo_.flags, " addr_bytes=", ofiWireInfo_.addr.size());
+      ofiWireInfo_.rank = static_cast<uint64_t>(config_.ofi.bootstrap->getRank());
+      ofiWireInfo_.addr = ofiResources_->address().fabric_data();
+       INFO(NET, "Endpoint OFI wire info: rank=", ofiWireInfo_.rank,
+         " flags=", "replaced with local", " addr_bytes=", ofiWireInfo_.addr.size());
 #else
       throw Error("OFI transport is not supported in this build", ErrorCode::InvalidUsage);
 #endif

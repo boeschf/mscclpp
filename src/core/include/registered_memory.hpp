@@ -39,7 +39,7 @@ template<>
 struct TransportInfo<TransportTagTrait<Transport::Ofi>::tag> {
   bool ofiLocal;
   const OfiMr* ofiMr;
-  OfiMrInfo ofiMrInfo;
+  libfatbat::region_info ofiMrInfo;
 };
 
 } // namespace detail
@@ -78,7 +78,7 @@ struct RegisteredMemory::Impl {
   std::unordered_map<Transport, std::unique_ptr<const IbMr>> ibMrMap;
 
   // Only used for OFI transport
-  std::unique_ptr<const OfiMr> ofiMr;
+  unique_memregion ofiMr;
 
   // Optional connection binding. Required for OFI local registrations and used
   // by the communicator to derive the peer for sendMemory/recvMemory.
