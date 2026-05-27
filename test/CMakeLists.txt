@@ -3,7 +3,7 @@
 
 find_package(MPI REQUIRED)
 
-set(TEST_LIBS_COMMON mscclpp ${GPU_LIBRARIES} ${NUMA_LIBRARIES} Threads::Threads)
+set(TEST_LIBS_COMMON mscclpp ${GPU_LIBRARIES} MSCCLPP::numa Threads::Threads)
 if(MSCCLPP_USE_IB)
     list(APPEND TEST_LIBS_COMMON ${IBVERBS_LIBRARIES})
 endif()
