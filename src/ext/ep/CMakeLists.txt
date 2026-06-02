@@ -102,5 +102,10 @@ elseif(MSCCLPP_USE_ROCM)
     target_compile_definitions(mscclpp_ep_cpp PRIVATE MSCCLPP_USE_ROCM)
 endif()
 
+string(REPLACE ";" "," _EP_RDMA_RANKS_CSV "${MSCCLPP_EP_RDMA_RANKS}")
+target_compile_definitions(mscclpp_ep_cpp PRIVATE
+    EP_NVL_PEERS_PER_NODE=${MSCCLPP_EP_NVL_PEERS_PER_NODE}
+    EP_RDMA_RANKS=${_EP_RDMA_RANKS_CSV})
+
 install(TARGETS mscclpp_ep_cpp
     LIBRARY DESTINATION ${INSTALL_PREFIX}/lib)

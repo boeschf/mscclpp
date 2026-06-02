@@ -322,7 +322,8 @@ __device__ __forceinline__ void unpack2(const dtype_b_t &packed, dtype_a_t &x, d
   x = unpacked_ptr[0], y = unpacked_ptr[1];
 }
 
-template <typename dtype_t>
+template <typename dtype_t,
+          typename std::enable_if<(sizeof(dtype_t) >= sizeof(int)) && std::is_trivially_copyable<dtype_t>::value, int>::type = 0>
 __device__ __forceinline__ dtype_t broadcast(dtype_t &ptr, int src_lane_idx) {
   EP_STATIC_ASSERT(sizeof(dtype_t) % sizeof(int) == 0, "");
   auto send_int_values = reinterpret_cast<int *>(&ptr);
@@ -331,6 +332,16 @@ __device__ __forceinline__ dtype_t broadcast(dtype_t &ptr, int src_lane_idx) {
   for (int i = 0; i < sizeof(dtype_t) / sizeof(int); ++i)
     recv_int_values[i] = __shfl_sync(0xffffffff, send_int_values[i], src_lane_idx);
   return *reinterpret_cast<dtype_t *>(recv_int_values);
+}
+template <typename dtype_t,
+          typename std::enable_if<(sizeof(dtype_t) < sizeof(int)) && std::is_trivially_copyable<dtype_t>::value, int>::type = 0>
+__device__ __forceinline__ dtype_t broadcast(dtype_t &ptr, int src_lane_idx) {
+  unsigned int packed = 0;
+  __builtin_memcpy(&packed, &ptr, sizeof(dtype_t));  // zero-extend into a 32-bit reg
+  packed = __shfl_sync(0xffffffff, packed, src_lane_idx);
+  dtype_t out;
+  __builtin_memcpy(&out, &packed, sizeof(dtype_t));
+  return out;
 }
 
 __forceinline__ __device__ int warp_reduce_sum(int value) {

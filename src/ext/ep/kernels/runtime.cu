@@ -24,13 +24,10 @@ __global__ void barrier(int** task_fifo_ptrs, int head, int rank) {
 }
 
 void barrier(int** task_fifo_ptrs, int head, int rank, int num_ranks, cudaStream_t stream) {
-#define BARRIER_LAUNCH_CASE(ranks)                                 \
-  LAUNCH_KERNEL(&cfg, barrier<ranks>, task_fifo_ptrs, head, rank); \
-  break
-
-  SETUP_LAUNCH_CONFIG(1, 32, stream);
-  SWITCH_RANKS(BARRIER_LAUNCH_CASE);
-#undef BARRIER_LAUNCH_CASE
+  allowed_nvl_ranks::lift(num_ranks, [&](auto N) {
+    constexpr int kNumRanks = N;
+    launch_kernel(1, 32, stream, barrier<kNumRanks>, task_fifo_ptrs, head, rank);
+  });
 }
 
 }  // namespace intranode

@@ -2,10 +2,9 @@
 // Licensed under the MIT License.
 #pragma once
 
+#include <cuda_runtime.h>
 #include <exception>
 #include <string>
-
-#include "configs.cuh"
 
 #ifndef EP_STATIC_ASSERT
 #define EP_STATIC_ASSERT(cond, reason) static_assert(cond, reason)

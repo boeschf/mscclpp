@@ -25,8 +25,6 @@ namespace mscclpp {
 namespace ep {
 
 struct Buffer {
-  EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS == 8, "The number of maximum NVLink peers must be 8");
-
  private:
   // Low-latency mode buffer
   int low_latency_buffer_idx = 0;
@@ -34,7 +32,7 @@ struct Buffer {
 
   // NVLink Buffer
   int64_t num_nvl_bytes;
-  void* buffer_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
+  void* buffer_ptrs[num_nvl_peers] = {nullptr};
   void** buffer_ptrs_gpu = nullptr;
 
   // NVSHMEM Buffer
@@ -45,7 +43,7 @@ struct Buffer {
   int device_id;
   int rank, rdma_rank, nvl_rank;
   int num_ranks, num_rdma_ranks, num_nvl_ranks;
-  cudaIpcMemHandle_t ipc_handles[NUM_MAX_NVL_PEERS];
+  cudaIpcMemHandle_t ipc_handles[num_nvl_peers];
 
   // Stream for communication
   at::cuda::CUDAStream comm_stream;
@@ -55,7 +53,7 @@ struct Buffer {
 
   // Task fifo
   int head = 0;
-  int* task_fifo_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
+  int* task_fifo_ptrs[num_nvl_peers] = {nullptr};
   int** task_fifo_ptrs_gpu = nullptr;
 
   // Workspace
@@ -93,8 +91,8 @@ struct Buffer {
   // ``peer_rdma_bases[r]`` aliases rank ``r``'s ``rdma_buffer_ptr`` via
   // ``cudaIpcOpenMemHandle`` (lazy peer access). Populated in ``sync()`` when
   // ``low_latency_mode && num_rdma_ranks == 1``; null otherwise.
-  cudaIpcMemHandle_t rdma_ipc_handles[NUM_MAX_NVL_PEERS];
-  void* peer_rdma_bases[NUM_MAX_NVL_PEERS] = {nullptr};
+  cudaIpcMemHandle_t rdma_ipc_handles[num_nvl_peers];
+  void* peer_rdma_bases[num_nvl_peers] = {nullptr};
   void** peer_rdma_bases_gpu = nullptr;
   // MemoryChannels over CUDA IPC used only for the LL barrier ring.
   std::vector<mscclpp::MemoryChannel> ll_memory_channels;

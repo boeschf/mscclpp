@@ -41,10 +41,10 @@ import torch
 import torch.distributed as dist
 
 
-def init_dist():
+def init_dist(num_max_nvl_peers: int):
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ.get("LOCAL_RANK", rank % 8))
+    local_rank = int(os.environ.get("LOCAL_RANK", rank % num_max_nvl_peers))
     torch.cuda.set_device(local_rank)
     dist.init_process_group(
         backend="nccl", world_size=world_size, rank=rank, device_id=torch.device(f"cuda:{local_rank}")
@@ -68,13 +68,16 @@ def inplace_unique(x: torch.Tensor, num_slots: int):
 
 
 def main():
-    rank, num_ranks, local_rank, group = init_dist()
     from mscclpp.ext import ep
+    import mscclpp_ep_cpp as _cpp
 
-    NUM_MAX_NVL_PEERS = 8
+    NUM_MAX_NVL_PEERS = _cpp.num_nvl_peers
+
+    rank, num_ranks, local_rank, group = init_dist(NUM_MAX_NVL_PEERS)
+
     assert (
         num_ranks % NUM_MAX_NVL_PEERS == 0 and num_ranks > NUM_MAX_NVL_PEERS
-    ), f"expected >1 node with 8 GPUs each, got num_ranks={num_ranks}"
+    ), f"expected >1 node with {NUM_MAX_NVL_PEERS} GPUs each, got num_ranks={num_ranks}"
     num_nodes = num_ranks // NUM_MAX_NVL_PEERS
     num_local_ranks = NUM_MAX_NVL_PEERS
 

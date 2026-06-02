@@ -78,8 +78,8 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
   }
   // Task fifo memory
   int64_t fifo_bytes = sizeof(int) * NUM_MAX_FIFO_SLOTS;
-  int64_t buffer_ptr_bytes = sizeof(void*) * NUM_MAX_NVL_PEERS;
-  int64_t task_ptr_bytes = sizeof(int*) * NUM_MAX_NVL_PEERS;
+  int64_t buffer_ptr_bytes = sizeof(void*) * num_nvl_peers;
+  int64_t task_ptr_bytes = sizeof(int*) * num_nvl_peers;
 
   // Common checks
   EP_HOST_ASSERT(num_nvl_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and
@@ -87,14 +87,14 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
   EP_HOST_ASSERT(num_rdma_bytes % NUM_BUFFER_ALIGNMENT_BYTES == 0 and
                  (low_latency_mode or num_rdma_bytes <= std::numeric_limits<int>::max()));
   EP_HOST_ASSERT(0 <= rank and rank < num_ranks and
-                 (num_ranks <= NUM_MAX_NVL_PEERS * NUM_MAX_RDMA_PEERS or low_latency_mode));
-  EP_HOST_ASSERT(num_ranks < NUM_MAX_NVL_PEERS or num_ranks % NUM_MAX_NVL_PEERS == 0);
-  if (num_rdma_bytes > 0) EP_HOST_ASSERT(num_ranks > NUM_MAX_NVL_PEERS or low_latency_mode);
+                 (num_ranks <= num_nvl_peers * max_rdma_ranks or low_latency_mode));
+  EP_HOST_ASSERT(num_ranks < num_nvl_peers or num_ranks % num_nvl_peers == 0);
+  if (num_rdma_bytes > 0) EP_HOST_ASSERT(num_ranks > num_nvl_peers or low_latency_mode);
 
   // Get ranks
   CUDA_CHECK(cudaGetDevice(&device_id));
-  rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
-  num_rdma_ranks = std::max(1, num_ranks / NUM_MAX_NVL_PEERS), num_nvl_ranks = std::min(num_ranks, NUM_MAX_NVL_PEERS);
+  rdma_rank = rank / num_nvl_peers, nvl_rank = rank % num_nvl_peers;
+  num_rdma_ranks = std::max(1, num_ranks / num_nvl_peers), num_nvl_ranks = std::min(num_ranks, num_nvl_peers);
 
   // Get device info
   cudaDeviceProp device_prop = {};
@@ -195,7 +195,7 @@ void Buffer::move_fifo_slots(int num_slots) { head = (head + num_ranks * num_slo
 
 bool Buffer::is_available() const { return available; }
 
-bool Buffer::is_internode_available() const { return is_available() and num_ranks > NUM_MAX_NVL_PEERS; }
+bool Buffer::is_internode_available() const { return is_available() and num_ranks > num_nvl_peers; }
 
 int Buffer::get_num_rdma_ranks() const { return num_rdma_ranks; }
 
@@ -264,9 +264,9 @@ void Buffer::sync(const std::vector<int>& device_ids,
     }
 
     // Copy all buffer and task pointers to GPU
-    CUDA_CHECK(cudaMemcpy(buffer_ptrs_gpu, buffer_ptrs, sizeof(void*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(buffer_ptrs_gpu, buffer_ptrs, sizeof(void*) * num_nvl_peers, cudaMemcpyHostToDevice));
     CUDA_CHECK(
-        cudaMemcpy(task_fifo_ptrs_gpu, task_fifo_ptrs, sizeof(int*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
+        cudaMemcpy(task_fifo_ptrs_gpu, task_fifo_ptrs, sizeof(int*) * num_nvl_peers, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaDeviceSynchronize());
 
     // create connections
@@ -459,7 +459,7 @@ void Buffer::sync(const std::vector<int>& device_ids,
     // ------------------------------------------------------------------
     if (low_latency_mode and num_rdma_ranks == 1) {
       EP_HOST_ASSERT(num_ranks == num_nvl_ranks);
-      EP_HOST_ASSERT(num_ranks <= NUM_MAX_NVL_PEERS);
+      EP_HOST_ASSERT(num_ranks <= num_nvl_peers);
 
       // 1. Exchange CUDA IPC handles for rdma_buffer_ptr via bootstrap.
       CUDA_CHECK(cudaIpcGetMemHandle(&rdma_ipc_handles[rank], rdma_buffer_ptr));
@@ -473,9 +473,9 @@ void Buffer::sync(const std::vector<int>& device_ids,
         rdma_ipc_handles[r] = all_rdma_handles[r];
         CUDA_CHECK(cudaIpcOpenMemHandle(&peer_rdma_bases[r], rdma_ipc_handles[r], cudaIpcMemLazyEnablePeerAccess));
       }
-      CUDA_CHECK(cudaMalloc(&peer_rdma_bases_gpu, sizeof(void*) * NUM_MAX_NVL_PEERS));
+      CUDA_CHECK(cudaMalloc(&peer_rdma_bases_gpu, sizeof(void*) * num_nvl_peers));
       CUDA_CHECK(
-          cudaMemcpy(peer_rdma_bases_gpu, peer_rdma_bases, sizeof(void*) * NUM_MAX_NVL_PEERS, cudaMemcpyHostToDevice));
+          cudaMemcpy(peer_rdma_bases_gpu, peer_rdma_bases, sizeof(void*) * num_nvl_peers, cudaMemcpyHostToDevice));
 
       // 2. Build MemoryChannels for the per-peer barrier ring. These use
       //    CUDA IPC connections (distinct tag from the existing port-channel
@@ -950,7 +950,7 @@ Buffer::internode_dispatch(
 
   const int num_channels = config.num_sms / 2;
   EP_HOST_ASSERT(config.num_sms % 2 == 0);
-  EP_HOST_ASSERT(0 < get_num_rdma_ranks() and get_num_rdma_ranks() <= NUM_MAX_RDMA_PEERS);
+  EP_HOST_ASSERT(0 < get_num_rdma_ranks() and get_num_rdma_ranks() <= max_rdma_ranks);
 
   bool cached_mode = cached_rdma_channel_prefix_matrix.has_value();
   if (cached_mode) {
@@ -1136,7 +1136,7 @@ Buffer::internode_dispatch(
         torch::empty({num_rdma_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
     recv_gbl_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
     send_rdma_head = torch::empty({num_tokens, num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
-    send_nvl_head = torch::empty({num_rdma_recv_tokens, NUM_MAX_NVL_PEERS}, dtype(torch::kInt32).device(torch::kCUDA));
+    send_nvl_head = torch::empty({num_rdma_recv_tokens, num_nvl_peers}, dtype(torch::kInt32).device(torch::kCUDA));
   }
 
   int64_t* recv_topk_idx_ptr = nullptr;
@@ -1246,7 +1246,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
   EP_HOST_ASSERT(gbl_channel_prefix_matrix.size(0) == num_ranks and gbl_channel_prefix_matrix.size(1) == num_channels);
   EP_HOST_ASSERT(combined_rdma_head.dim() == 2 and combined_rdma_head.size(0) == num_combined_tokens and
                  combined_rdma_head.size(1) == num_rdma_ranks);
-  EP_HOST_ASSERT(combined_nvl_head.dim() == 2 and combined_nvl_head.size(1) == NUM_MAX_NVL_PEERS);
+  EP_HOST_ASSERT(combined_nvl_head.dim() == 2 and combined_nvl_head.size(1) == num_nvl_peers);
 
   auto compute_stream = at::cuda::getCurrentCUDAStream();
   if (allocate_on_comm_stream) {

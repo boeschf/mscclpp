@@ -21,6 +21,9 @@ namespace py = pybind11;
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "MSCCL++ Expert-Parallel (MoE dispatch/combine) extension";
 
+  m.attr("num_nvl_peers")   = pybind11::int_(mscclpp::ep::num_nvl_peers);
+  m.attr("max_rdma_ranks") = pybind11::int_(mscclpp::ep::max_rdma_ranks);
+
   py::class_<mscclpp::ep::Config>(m, "Config")
       .def(py::init<int, int, int, int, int>(), py::arg("num_sms") = 20, py::arg("num_max_nvl_chunked_send_tokens") = 6,
            py::arg("num_max_nvl_chunked_recv_tokens") = 256, py::arg("num_max_rdma_chunked_send_tokens") = 6,
