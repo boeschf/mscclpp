@@ -127,15 +127,10 @@ void clean_low_latency_buffer(int64_t* clean_0, int num_clean_int_0, int64_t* cl
                               mscclpp::MemoryChannelDeviceHandle* memory_channel_handles, bool use_ipc_path,
                               cudaStream_t stream) {
   constexpr int kNumThreads = 256;
-
-  auto cfg = make_cooperative_launch_config(1, kNumThreads, stream);
-  if (use_ipc_path) {
-    launch_kernel(cfg, clean_low_latency_buffer<kNumThreads, true>, clean_0, num_clean_int_0, clean_1,
+  auto kernel_func = use_ipc_path ? clean_low_latency_buffer<kNumThreads, true> 
+                                  : clean_low_latency_buffer<kNumThreads, false>;
+  launch_kernel(1, kNumThreads, stream, kernel_func, clean_0, num_clean_int_0, clean_1,
                   num_clean_int_1, port_channel_handles, memory_channel_handles, rank, num_ranks);
-  } else {
-    launch_kernel(cfg, clean_low_latency_buffer<kNumThreads, false>, clean_0, num_clean_int_0, clean_1,
-                  num_clean_int_1, port_channel_handles, memory_channel_handles, rank, num_ranks);
-  }
 }
 
 // ---------------------------------------------------------------------------
