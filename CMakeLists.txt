@@ -28,7 +28,8 @@ if(Git_FOUND)
         COMMAND "${GIT_EXECUTABLE}" rev-parse --short=12 HEAD
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         OUTPUT_VARIABLE _git_out
-        OUTPUT_STRIP_TRAILING_WHITESPACE)
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
     if(NOT _git_out STREQUAL "")
         set(GIT_HASH "${_git_out}")
     endif()
