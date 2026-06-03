@@ -1,15 +1,16 @@
-# Copyright (c) Microsoft Corporation. Licensed under the MIT License.
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
 
 cmake_minimum_required(VERSION 3.25)
 project(mscclpp LANGUAGES CXX)
 
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" MSCCLPP_VERSION_CONTENT)
 if(MSCCLPP_VERSION_CONTENT MATCHES "^([0-9]+)\\.([0-9]+)\\.([0-9]+)")
-  set(MSCCLPP_MAJOR "${CMAKE_MATCH_1}")
-  set(MSCCLPP_MINOR "${CMAKE_MATCH_2}")
-  set(MSCCLPP_PATCH "${CMAKE_MATCH_3}")
+    set(MSCCLPP_MAJOR "${CMAKE_MATCH_1}")
+    set(MSCCLPP_MINOR "${CMAKE_MATCH_2}")
+    set(MSCCLPP_PATCH "${CMAKE_MATCH_3}")
 else()
-  message(FATAL_ERROR "VERSION file must be in the format MAJOR.MINOR.PATCH")
+    message(FATAL_ERROR "VERSION file must be in the format MAJOR.MINOR.PATCH")
 endif()
 
 set(MSCCLPP_SOVERSION ${MSCCLPP_MAJOR})
@@ -23,25 +24,28 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 find_package(Git)
 set(GIT_HASH "UNKNOWN")
 if(Git_FOUND)
-  execute_process(
-    COMMAND "${GIT_EXECUTABLE}" rev-parse --short=12 HEAD
-    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    OUTPUT_VARIABLE _git_out
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
-  if(NOT _git_out STREQUAL "")
-    set(GIT_HASH "${_git_out}")
-  endif()
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" rev-parse --short=12 HEAD
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        OUTPUT_VARIABLE _git_out
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT _git_out STREQUAL "")
+        set(GIT_HASH "${_git_out}")
+    endif()
 else()
-  message(WARNING "Git not found, setting GIT_HASH to 'UNKNOWN'")
+    message(WARNING "Git not found, setting GIT_HASH to 'UNKNOWN'")
 endif()
 
-configure_file("${CMAKE_CURRENT_SOURCE_DIR}/include/mscclpp/version.hpp.in"
-               "${CMAKE_CURRENT_BINARY_DIR}/include/mscclpp/version.hpp" @ONLY)
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/mscclpp/version.hpp.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/include/mscclpp/version.hpp"
+    @ONLY
+)
 
 list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
 # Options
-option(MSCCLPP_ENABLE_TRACE "Enable tracing" ON)
+option(MSCCLPP_ENABLE_TRACE "Enable tracing" OFF)
 option(MSCCLPP_BUILD_TESTS "Build tests" OFF)
 option(MSCCLPP_BUILD_PYTHON_BINDINGS "Build Python bindings" ON)
 option(MSCCLPP_BUILD_EXT_NCCL "Build NCCL interfaces" ON)
@@ -55,150 +59,131 @@ option(MSCCLPP_NPKIT_FLAGS "Set NPKIT flags" OFF)
 option(MSCCLPP_ENABLE_COVERAGE "Enable code coverage" OFF)
 option(MSCCLPP_DISABLE_NB_LEAK_WARNINGS "Disable Nanobind leak warnings" ON)
 option(MSCCLPP_BUILD_EXAMPLES "Build examples" ON)
-set(MSCCLPP_GPU_ARCHS
-    ""
-    CACHE
-      STRING
-      "Specify GPU architectures with delimiters (comma, space, or semicolon).")
+set(MSCCLPP_GPU_ARCHS "" CACHE STRING "Specify GPU architectures with delimiters (comma, space, or semicolon).")
 
 if(MSCCLPP_BYPASS_GPU_CHECK)
-  if(MSCCLPP_USE_CUDA)
-    message(STATUS "Bypassing GPU check: using NVIDIA/CUDA.")
-    find_package(CUDAToolkit REQUIRED)
-  elseif(MSCCLPP_USE_ROCM)
-    message(STATUS "Bypassing GPU check: using AMD/ROCm.")
-    # Temporal fix for rocm5.6
-    set(CMAKE_PREFIX_PATH "/opt/rocm;${CMAKE_PREFIX_PATH}")
-    find_package(hip REQUIRED)
-  else()
-    message(
-      FATAL_ERROR
-        "Bypassing GPU check: neither NVIDIA/CUDA nor AMD/ROCm is specified.")
-  endif()
+    if(MSCCLPP_USE_CUDA)
+        message(STATUS "Bypassing GPU check: using NVIDIA/CUDA.")
+        find_package(CUDAToolkit REQUIRED)
+    elseif(MSCCLPP_USE_ROCM)
+        message(STATUS "Bypassing GPU check: using AMD/ROCm.")
+        # Temporal fix for rocm5.6
+        set(CMAKE_PREFIX_PATH "/opt/rocm;${CMAKE_PREFIX_PATH}")
+        find_package(hip REQUIRED)
+    else()
+        message(FATAL_ERROR "Bypassing GPU check: neither NVIDIA/CUDA nor AMD/ROCm is specified.")
+    endif()
 else()
-  # Detect GPUs
-  include(CheckNvidiaGpu)
-  include(CheckAmdGpu)
-  if(NVIDIA_FOUND AND AMD_FOUND)
-    message(
-      STATUS "Detected NVIDIA/CUDA and AMD/ROCm: prioritizing NVIDIA/CUDA.")
-    set(MSCCLPP_USE_CUDA ON)
-    set(MSCCLPP_USE_ROCM OFF)
-  elseif(NVIDIA_FOUND)
-    message(STATUS "Detected NVIDIA/CUDA.")
-    set(MSCCLPP_USE_CUDA ON)
-    set(MSCCLPP_USE_ROCM OFF)
-  elseif(AMD_FOUND)
-    message(STATUS "Detected AMD/ROCm.")
-    set(MSCCLPP_USE_CUDA OFF)
-    set(MSCCLPP_USE_ROCM ON)
-  elseif(CUDAToolkit_FOUND)
-    message(
-      WARNING
-        "CUDAToolkit found but no compatible GPU detected. Defaulting to CUDA.")
-    set(MSCCLPP_USE_CUDA ON)
-    set(MSCCLPP_USE_ROCM OFF)
-  elseif(hip_FOUND)
-    message(
-      WARNING "HIP found but no compatible GPU detected. Defaulting to ROCm.")
-    set(MSCCLPP_USE_CUDA OFF)
-    set(MSCCLPP_USE_ROCM ON)
-  else()
-    message(
-      FATAL_ERROR
-        "No compatible GPU found. Set MSCCLPP_USE_CUDA or MSCCLPP_USE_ROCM to ON."
-    )
-  endif()
+    # Detect GPUs
+    include(CheckNvidiaGpu)
+    include(CheckAmdGpu)
+    if(NVIDIA_FOUND AND AMD_FOUND)
+        message(STATUS "Detected NVIDIA/CUDA and AMD/ROCm: prioritizing NVIDIA/CUDA.")
+        set(MSCCLPP_USE_CUDA ON)
+        set(MSCCLPP_USE_ROCM OFF)
+    elseif(NVIDIA_FOUND)
+        message(STATUS "Detected NVIDIA/CUDA.")
+        set(MSCCLPP_USE_CUDA ON)
+        set(MSCCLPP_USE_ROCM OFF)
+    elseif(AMD_FOUND)
+        message(STATUS "Detected AMD/ROCm.")
+        set(MSCCLPP_USE_CUDA OFF)
+        set(MSCCLPP_USE_ROCM ON)
+    elseif(CUDAToolkit_FOUND)
+        message(WARNING "CUDAToolkit found but no compatible GPU detected. Defaulting to CUDA.")
+        set(MSCCLPP_USE_CUDA ON)
+        set(MSCCLPP_USE_ROCM OFF)
+    elseif(hip_FOUND)
+        message(WARNING "HIP found but no compatible GPU detected. Defaulting to ROCm.")
+        set(MSCCLPP_USE_CUDA OFF)
+        set(MSCCLPP_USE_ROCM ON)
+    else()
+        message(FATAL_ERROR "No compatible GPU found. Set MSCCLPP_USE_CUDA or MSCCLPP_USE_ROCM to ON.")
+    endif()
 endif()
 
 # Code coverage setup
 if(MSCCLPP_ENABLE_COVERAGE)
-  if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-    message(
-      WARNING
-        "Code coverage results with an optimized (non-Debug) build may be misleading"
-    )
-  endif()
-
-  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    message(STATUS "Code coverage enabled")
-
-    # Add coverage flags to C++ targets only (not CUDA)
-    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:--coverage>)
-    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-O0>)
-    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-g>)
-    add_link_options($<$<LINK_LANGUAGE:CXX>:--coverage>)
-
-    # Find lcov
-    find_program(LCOV_PATH lcov)
-
-    if(NOT LCOV_PATH)
-      message(
-        WARNING "lcov not found. Install lcov to generate coverage reports.")
+    if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+        message(WARNING "Code coverage results with an optimized (non-Debug) build may be misleading")
     endif()
 
-    if(LCOV_PATH)
-      # Add coverage target
-      add_custom_target(
-        coverage
-        COMMAND ${CMAKE_COMMAND} -E echo "Removing old coverage data..."
-        COMMAND ${LCOV_PATH} --directory . --zerocounters
-        COMMAND ${CMAKE_COMMAND} -E echo "Running tests..."
-        COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-        COMMAND ${CMAKE_COMMAND} -E echo "Collecting coverage data..."
-        COMMAND ${LCOV_PATH} --directory . --capture --output-file coverage.info
-        COMMAND ${CMAKE_COMMAND} -E echo "Filtering coverage data..."
-        COMMAND ${LCOV_PATH} --remove coverage.info '/usr/*' '*/test/*'
-                '*/build/*' --output-file coverage.info
-        COMMAND ${CMAKE_COMMAND} -E echo
-                "Coverage report generated in coverage.info"
-        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-        COMMENT "Generating code coverage report")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        message(STATUS "Code coverage enabled")
 
-      # Add coverage clean target
-      add_custom_target(
-        coverage-clean
-        COMMAND ${CMAKE_COMMAND} -E remove coverage.info
-        COMMAND ${LCOV_PATH} --directory . --zerocounters
-        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-        COMMENT "Cleaning coverage data")
+        # Add coverage flags to C++ targets only (not CUDA)
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:--coverage>)
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-O0>)
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-g>)
+        add_link_options($<$<LINK_LANGUAGE:CXX>:--coverage>)
+
+        # Find lcov
+        find_program(LCOV_PATH lcov)
+
+        if(NOT LCOV_PATH)
+            message(WARNING "lcov not found. Install lcov to generate coverage reports.")
+        endif()
+
+        if(LCOV_PATH)
+            # Add coverage target
+            add_custom_target(coverage
+                COMMAND ${CMAKE_COMMAND} -E echo "Removing old coverage data..."
+                COMMAND ${LCOV_PATH} --directory . --zerocounters
+
+                COMMAND ${CMAKE_COMMAND} -E echo "Running tests..."
+                COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+
+                COMMAND ${CMAKE_COMMAND} -E echo "Collecting coverage data..."
+                COMMAND ${LCOV_PATH} --directory . --capture --output-file coverage.info
+
+                COMMAND ${CMAKE_COMMAND} -E echo "Filtering coverage data..."
+                COMMAND ${LCOV_PATH} --remove coverage.info '/usr/*' '*/test/*' '*/build/*' --output-file coverage.info
+
+                COMMAND ${CMAKE_COMMAND} -E echo "Coverage report generated in coverage.info"
+
+                WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+                COMMENT "Generating code coverage report"
+            )
+
+            # Add coverage clean target
+            add_custom_target(coverage-clean
+                COMMAND ${CMAKE_COMMAND} -E remove coverage.info
+                COMMAND ${LCOV_PATH} --directory . --zerocounters
+                WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+                COMMENT "Cleaning coverage data"
+            )
+        endif()
+    else()
+        message(WARNING "Code coverage is only supported with GCC or Clang compilers")
     endif()
-  else()
-    message(
-      WARNING "Code coverage is only supported with GCC or Clang compilers")
-  endif()
 endif()
 if(MSCCLPP_GPU_ARCHS)
-  string(STRIP "${MSCCLPP_GPU_ARCHS}" MSCCLPP_GPU_ARCHS)
-  string(REPLACE " " ";" MSCCLPP_GPU_ARCHS "${MSCCLPP_GPU_ARCHS}")
-  string(REPLACE "," ";" MSCCLPP_GPU_ARCHS "${MSCCLPP_GPU_ARCHS}")
-  if(NOT MSCCLPP_GPU_ARCHS)
-    message(
-      FATAL_ERROR
-        "MSCCLPP_GPU_ARCHS is empty. Specify GPU architectures or leave unset.")
-  endif()
+    string(STRIP "${MSCCLPP_GPU_ARCHS}" MSCCLPP_GPU_ARCHS)
+    string(REPLACE " " ";" MSCCLPP_GPU_ARCHS "${MSCCLPP_GPU_ARCHS}")
+    string(REPLACE "," ";" MSCCLPP_GPU_ARCHS "${MSCCLPP_GPU_ARCHS}")
+    if(NOT MSCCLPP_GPU_ARCHS)
+        message(FATAL_ERROR "MSCCLPP_GPU_ARCHS is empty. Specify GPU architectures or leave unset.")
+    endif()
 elseif(MSCCLPP_USE_CUDA)
-  if(NVIDIA_FOUND)
-    set(MSCCLPP_GPU_ARCHS "native")
-  else()
-    if(CUDAToolkit_VERSION VERSION_LESS "11.8")
-      message(
-        FATAL_ERROR "CUDA 11.8 or higher required, found ${CUDAToolkit_VERSION}"
-      )
+    if(NVIDIA_FOUND)
+        set(MSCCLPP_GPU_ARCHS "native")
+    else()
+        if(CUDAToolkit_VERSION VERSION_LESS "11.8")
+            message(FATAL_ERROR "CUDA 11.8 or higher required, found ${CUDAToolkit_VERSION}")
+        endif()
+        set(MSCCLPP_GPU_ARCHS 80)
+        if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.0")
+            list(APPEND MSCCLPP_GPU_ARCHS 90)
+        endif()
+        if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+            list(APPEND MSCCLPP_GPU_ARCHS 100)
+        endif()
+        if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.9")
+            list(APPEND MSCCLPP_GPU_ARCHS 120)
+        endif()
     endif()
-    set(MSCCLPP_GPU_ARCHS 80)
-    if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.0")
-      list(APPEND MSCCLPP_GPU_ARCHS 90)
-    endif()
-    if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
-      list(APPEND MSCCLPP_GPU_ARCHS 100)
-    endif()
-    if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.9")
-      list(APPEND MSCCLPP_GPU_ARCHS 120)
-    endif()
-  endif()
 elseif(MSCCLPP_USE_ROCM)
-  set(MSCCLPP_GPU_ARCHS gfx90a gfx941 gfx942)
+    set(MSCCLPP_GPU_ARCHS gfx90a gfx941 gfx942)
 endif()
 
 message(STATUS "GPU architectures: ${MSCCLPP_GPU_ARCHS}")
@@ -207,95 +192,86 @@ message(STATUS "GPU architectures: ${MSCCLPP_GPU_ARCHS}")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
 if(MSCCLPP_USE_CUDA)
-  set(CMAKE_CUDA_STANDARD 17)
-  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -Wall,-Wextra")
-  enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler -Wall,-Wextra")
+    enable_language(CUDA)
 
-  set(CMAKE_CUDA_ARCHITECTURES ${MSCCLPP_GPU_ARCHS})
+    set(CMAKE_CUDA_ARCHITECTURES ${MSCCLPP_GPU_ARCHS})
 
-  set(GPU_INCLUDE_DIRS ${CUDAToolkit_INCLUDE_DIRS})
+    set(GPU_INCLUDE_DIRS ${CUDAToolkit_INCLUDE_DIRS})
 
-  find_package(CCCL PATHS ${CUDAToolkit_LIBRARY_DIR}/cmake/cccl)
-  if(CCCL_FOUND AND CUDAToolkit_VERSION_MAJOR GREATER 12)
-    set(GPU_LIBRARIES CUDA::cudart CUDA::cuda_driver CCCL::CCCL)
-  else()
-    set(GPU_LIBRARIES CUDA::cudart CUDA::cuda_driver)
-  endif()
+    find_package(CCCL PATHS ${CUDAToolkit_LIBRARY_DIR}/cmake/cccl)
+    if(CCCL_FOUND AND CUDAToolkit_VERSION_MAJOR GREATER 12)
+        set(GPU_LIBRARIES CUDA::cudart CUDA::cuda_driver CCCL::CCCL)
+    else()
+        set(GPU_LIBRARIES CUDA::cudart CUDA::cuda_driver)
+    endif()
 else()
-  set(CMAKE_HIP_STANDARD 17)
-  set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Wall -Wextra")
+    set(CMAKE_HIP_STANDARD 17)
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -Wall -Wextra")
 
-  set(CMAKE_HIP_ARCHITECTURES ${MSCCLPP_GPU_ARCHS})
+    set(CMAKE_HIP_ARCHITECTURES ${MSCCLPP_GPU_ARCHS})
 
-  set(GPU_LIBRARIES hip::device)
-  set(GPU_INCLUDE_DIRS ${hip_INCLUDE_DIRS})
+    set(GPU_LIBRARIES hip::device)
+    set(GPU_INCLUDE_DIRS ${hip_INCLUDE_DIRS})
 endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-  add_compile_definitions(DEBUG_BUILD)
+    add_compile_definitions(DEBUG_BUILD)
 endif()
 
 if(MSCCLPP_USE_IB)
-  find_package(IBVerbs)
-  if(NOT IBVERBS_FOUND)
-    message(
-      FATAL_ERROR
-        "IBVerbs not found. Install libibverbs-dev or rdma-core-devel. If you want to disable InfiniBand, add `-DMSCCLPP_USE_IB=OFF` in your cmake command."
-    )
-  endif()
-  find_package(MLX5)
-  if(MLX5_FOUND)
-    message(STATUS "MLX5 Direct Verbs found: ${MLX5_LIBRARIES}")
-  else()
-    message(STATUS "MLX5 Direct Verbs not found, mlx5dv optimizations disabled")
-  endif()
+    find_package(IBVerbs)
+    if(NOT IBVERBS_FOUND)
+        message(FATAL_ERROR "IBVerbs not found. Install libibverbs-dev or rdma-core-devel. If you want to disable InfiniBand, add `-DMSCCLPP_USE_IB=OFF` in your cmake command.")
+    endif()
+    find_package(MLX5)
+    if(MLX5_FOUND)
+        message(STATUS "MLX5 Direct Verbs found: ${MLX5_LIBRARIES}")
+    else()
+        message(STATUS "MLX5 Direct Verbs not found, mlx5dv optimizations disabled")
+    endif()
 endif()
 
 find_package(NUMA REQUIRED)
 find_package(Threads REQUIRED)
 
-option(MSCCLPP_USE_GDRCOPY
-       "Use GDRCopy for direct GPU memory access from host." ON)
+option(MSCCLPP_USE_GDRCOPY "Use GDRCopy for direct GPU memory access from host." ON)
 if(MSCCLPP_USE_ROCM)
-  set(MSCCLPP_USE_GDRCOPY OFF)
+    set(MSCCLPP_USE_GDRCOPY OFF)
 endif()
 if(MSCCLPP_USE_GDRCOPY)
-  find_package(GDRCopy)
-  if(NOT GDRCOPY_FOUND)
-    message(STATUS "GDRCopy not found, disabling GDRCopy support")
-    set(MSCCLPP_USE_GDRCOPY OFF)
-  else()
-    message(STATUS "GDRCopy found: ${GDRCOPY_LIBRARIES}")
-  endif()
+    find_package(GDRCopy)
+    if(NOT GDRCOPY_FOUND)
+        message(STATUS "GDRCopy not found, disabling GDRCopy support")
+        set(MSCCLPP_USE_GDRCOPY OFF)
+    else()
+        message(STATUS "GDRCopy found: ${GDRCOPY_LIBRARIES}")
+    endif()
 endif()
 
 include(FetchContent)
-FetchContent_Declare(
-  json
-  GIT_REPOSITORY https://github.com/nlohmann/json.git
-  GIT_TAG v3.12.0)
+FetchContent_Declare(json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.12.0
+)
 FetchContent_MakeAvailable(json)
 
 if(MSCCLPP_USE_OFI)
-  # ------------------------------------------------------------------------------
-  # libFatbat
-  # ------------------------------------------------------------------------------
-  if(EXISTS ${PROJECT_SOURCE_DIR}/ext/libfatbat)
-    set(FETCHCONTENT_SOURCE_DIR_LIBFATBAT ${PROJECT_SOURCE_DIR}/ext/libfatbat)
-  endif()
-  FetchContent_Declare(
-    libFatbat
-    GIT_REPOSITORY "https://github.com/biddisco/libfatbat.git"
-    GIT_TAG "develop")
-  FetchContent_MakeAvailable(libFatbat)
-  message(
-    STATUS
-      "✅ libFatbat building: (${libFatbat_VERSION}) from ${libFatbat_SOURCE_DIR} in ${libFatbat_BINARY_DIR}"
-  )
+    # libFatbat
+    if(EXISTS ${PROJECT_SOURCE_DIR}/ext/libfatbat)
+        set(FETCHCONTENT_SOURCE_DIR_LIBFATBAT ${PROJECT_SOURCE_DIR}/ext/libfatbat)
+    endif()
+    FetchContent_Declare(libFatbat
+        GIT_REPOSITORY "https://github.com/biddisco/libfatbat.git"
+        GIT_TAG "develop"
+    )
+    FetchContent_MakeAvailable(libFatbat)
+    message(STATUS "✅ libFatbat building: (${libFatbat_VERSION}) from ${libFatbat_SOURCE_DIR} in ${libFatbat_BINARY_DIR}")
 endif()
 
 if("${INSTALL_PREFIX}" STREQUAL "")
-  set(INSTALL_PREFIX "./")
+    set(INSTALL_PREFIX "./")
 endif()
 
 add_subdirectory(src)
@@ -303,15 +279,15 @@ add_subdirectory(include)
 
 # Tests
 if(MSCCLPP_BUILD_TESTS)
-  enable_testing() # Called here to allow ctest from the build directory
-  add_subdirectory(test)
+    enable_testing() # Called here to allow ctest from the build directory
+    add_subdirectory(test)
 endif()
 
 # Python bindings
 if(MSCCLPP_BUILD_PYTHON_BINDINGS)
-  add_subdirectory(python)
+    add_subdirectory(python)
 endif()
 
 if(MSCCLPP_BUILD_EXAMPLES)
-  add_subdirectory(examples/tutorials/04-port-channel)
+    add_subdirectory(examples/tutorials/04-port-channel)
 endif()
