@@ -92,8 +92,17 @@ target_link_libraries(mscclpp_ep_cpp PRIVATE mscclpp ${GPU_LIBRARIES} Threads::T
 #  - 4 is required for Azure GB200 NVL72 (4 GPUs per NUMA host).
 set(MSCCLPP_EP_NUM_MAX_NVL_PEERS "8" CACHE STRING
     "Compile-time NUM_MAX_NVL_PEERS for the EP kernels (8 for HGX, 4 for GB200)")
+set(MSCCLPP_EP_RDMA_RANKS "1;2;4;8;16;32" CACHE STRING
+    "Compiled num_rdma_ranks values (CMake list format)")
+string(REPLACE ";" "," _EP_RDMA_RANKS_CSV "${MSCCLPP_EP_RDMA_RANKS}")
+set(MSCCLPP_EP_HIDDEN_SIZES "2560;4096;5120;7168" CACHE STRING
+    "Compiled hidden_size values (CMake list format)")
+string(REPLACE ";" "," _EP_HIDDEN_SIZES_CSV "${MSCCLPP_EP_HIDDEN_SIZES}")
 target_compile_definitions(mscclpp_ep_cpp PRIVATE
-    NUM_MAX_NVL_PEERS=${MSCCLPP_EP_NUM_MAX_NVL_PEERS})
+    NUM_MAX_NVL_PEERS=${MSCCLPP_EP_NUM_MAX_NVL_PEERS}
+    EP_RDMA_RANKS=${_EP_RDMA_RANKS_CSV}
+    EP_HIDDEN_SIZES=${_EP_HIDDEN_SIZES_CSV}
+)
 
 # Kernel-side debug timeout (~10s) — set via:
 #   -DMSCCLPP_EP_KERNEL_DEBUG_TIMEOUT=ON

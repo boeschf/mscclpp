@@ -3,95 +3,44 @@
 #pragma once
 
 #include "configs.cuh"
+#include "exception.cuh"
+#include <utility>
 
-#ifndef SETUP_LAUNCH_CONFIG
-#define SETUP_LAUNCH_CONFIG(num_sms, num_threads, stream)                     \
-  cudaLaunchConfig_t cfg = {(num_sms), (num_threads), 0, stream, nullptr, 0}; \
-  cudaLaunchAttribute attr[1];                                                \
-  attr[0].id = cudaLaunchAttributeCooperative;                                \
-  attr[0].val.cooperative = 1;                                                \
-  cfg.attrs = attr;                                                           \
-  cfg.numAttrs = 1
-#endif
+namespace mscclpp::ep {
 
-#ifndef LAUNCH_KERNEL
-#define LAUNCH_KERNEL(config, kernel, ...) CUDA_CHECK(cudaLaunchKernelEx(config, kernel, ##__VA_ARGS__))
-#endif
+struct CooperativeLaunchConfig {
+  // `attrs` must come before `cfg` so its address is valid by the time `cfg`'s mem-init runs.
+  cudaLaunchAttribute attrs[1];
+  cudaLaunchConfig_t  cfg;
 
-#define SWITCH_RANKS(case_macro)                       \
-  do {                                                 \
-    switch (num_ranks) {                               \
-      case 2:                                          \
-        case_macro(2);                                 \
-      case 4:                                          \
-        case_macro(4);                                 \
-      case 8:                                          \
-        case_macro(8);                                 \
-      default:                                         \
-        EP_HOST_ASSERT(false and "Unsupported ranks"); \
-    }                                                  \
-  } while (false)
+  CooperativeLaunchConfig(dim3 grid, dim3 block, cudaStream_t stream) noexcept
+  : attrs{}, cfg{grid, block, /*dynamicSmemBytes=*/0, stream, attrs, /*numAttrs=*/1} {
+    attrs[0].id = cudaLaunchAttributeCooperative;
+    attrs[0].val.cooperative = 1;
+  }
 
-#define SWITCH_RDMA_RANKS(case_macro)                       \
-  do {                                                      \
-    switch (num_ranks / NUM_MAX_NVL_PEERS) {                \
-      case 2:                                               \
-        case_macro(2);                                      \
-      case 3:                                               \
-        case_macro(3);                                      \
-      case 4:                                               \
-        case_macro(4);                                      \
-      case 8:                                               \
-        case_macro(8);                                      \
-      case 16:                                              \
-        case_macro(16);                                     \
-      case 18:                                              \
-        case_macro(18);                                     \
-      case 20:                                              \
-        case_macro(20);                                     \
-      default:                                              \
-        EP_HOST_ASSERT(false and "Unsupported RDMA ranks"); \
-    }                                                       \
-  } while (false)
+  // `cfg.attrs` is an interior pointer into this object. Any copy or move
+  // would silently produce a dangling/foreign pointer, so forbid both.
+  CooperativeLaunchConfig(CooperativeLaunchConfig const&)            = delete;
+  CooperativeLaunchConfig(CooperativeLaunchConfig&&)                 = delete;
+  CooperativeLaunchConfig& operator=(CooperativeLaunchConfig const&) = delete;
+  CooperativeLaunchConfig& operator=(CooperativeLaunchConfig&&)      = delete;
 
-#define SWITCH_RANKS_WITH_DTYPE(dtype, case_macro)    \
-  do {                                                \
-    switch (num_ranks) {                              \
-      case 2:                                         \
-        case_macro(dtype, 2);                         \
-      case 4:                                         \
-        case_macro(dtype, 4);                         \
-      case 8:                                         \
-        case_macro(dtype, 8);                         \
-      default:                                        \
-        EP_HOST_ASSERT(false && "Unsupported ranks"); \
-    }                                                 \
-  } while (false)
+  cudaLaunchConfig_t const* handle() const noexcept { return &cfg; }
+};
 
-#define SWITCH_TYPES(case_macro)                     \
-  do {                                               \
-    switch (type) {                                  \
-      case CUDA_R_16BF:                              \
-        case_macro(nv_bfloat16);                     \
-      case CUDA_R_32F:                               \
-        case_macro(float);                           \
-      default:                                       \
-        EP_HOST_ASSERT(false && "Unsupported type"); \
-    }                                                \
-  } while (false)
+[[nodiscard]] inline CooperativeLaunchConfig make_cooperative_launch_config(dim3 grid, dim3 block, cudaStream_t stream) noexcept {
+  return {grid, block, stream};
+}
 
-#define SWITCH_HIDDEN(case_macro)                      \
-  do {                                                 \
-    switch (hidden) {                                  \
-      case 2560:                                       \
-        case_macro(2560);                              \
-      case 4096:                                       \
-        case_macro(4096);                              \
-      case 5120:                                       \
-        case_macro(5120);                              \
-      case 7168:                                       \
-        case_macro(7168);                              \
-      default:                                         \
-        EP_HOST_ASSERT(false && "Unsupported hidden"); \
-    }                                                  \
-  } while (false)
+template <typename... KernelArgs, typename... CallArgs>
+void launch_kernel(cudaLaunchConfig_t const& config, void (*kernel)(KernelArgs...), CallArgs&&... args) {
+    CUDA_CHECK(cudaLaunchKernelEx(config.handle(), kernel, std::forward<CallArgs>(args)...));
+}
+
+template <typename... KernelArgs, typename... CallArgs>
+void launch_kernel(dim3 grid, dim3 block, cudaStream_t stream, void (*kernel)(KernelArgs...), CallArgs&&... args) {
+  launch_kernel(make_cooperative_launch_config(grid, block, stream), kernel, std::forward<CallArgs>(args)...);
+}
+
+} // namespace mscclpp::ep

@@ -117,20 +117,17 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
                      int num_tokens, const bool* is_token_in_rank, int* channel_prefix_matrix,
                      int* rank_prefix_matrix_copy, int num_memset_int, int expert_alignment, void** buffer_ptrs,
                      int** task_fifo_ptrs, int head, int rank, cudaStream_t stream, int num_channels) {
-#define NOTIFY_DISPATCH_LAUNCH_CASE(ranks)                                                                         \
-  LAUNCH_KERNEL(&cfg, notify_dispatch<ranks>, num_tokens_per_rank, moe_recv_counter_mapped, num_tokens_per_expert, \
-                moe_recv_expert_counter_mapped, num_experts, num_tokens, num_channels, is_token_in_rank,           \
-                channel_prefix_matrix, rank_prefix_matrix_copy, num_memset_int, expert_alignment, buffer_ptrs,     \
-                task_fifo_ptrs, head, rank);                                                                       \
-  break
-
-  constexpr int kNumThreads = 128;
-  EP_HOST_ASSERT(num_experts % num_ranks == 0);
-  EP_HOST_ASSERT(num_experts / num_ranks <= kNumThreads and num_ranks <= kNumThreads);
-
-  SETUP_LAUNCH_CONFIG(1 + num_ranks, kNumThreads, stream);
-  SWITCH_RANKS(NOTIFY_DISPATCH_LAUNCH_CASE);
-#undef NOTIFY_DISPATCH_LAUNCH_CASE
+  allowed_nvl_ranks::lift(num_ranks, [&](auto N) {
+    constexpr int kNumRanks = N;
+    constexpr int kNumThreads = 128;
+    static_assert(kNumRanks <= kNumThreads, "Each rank needs at least one thread to write data back");
+    EP_HOST_ASSERT(num_experts % kNumRanks == 0);
+    EP_HOST_ASSERT(num_experts / kNumRanks <= kNumThreads);
+    launch_kernel(1 + kNumRanks, kNumThreads, stream, notify_dispatch<kNumRanks>, num_tokens_per_rank,
+                  moe_recv_counter_mapped, num_tokens_per_expert, moe_recv_expert_counter_mapped, num_experts,
+                  num_tokens, is_token_in_rank, channel_prefix_matrix, rank_prefix_matrix_copy, num_memset_int,
+                  expert_alignment, buffer_ptrs, task_fifo_ptrs, head, rank);
+  });
 }
 
 template <int kNumRanks>
@@ -157,14 +154,11 @@ __global__ void cached_notify_dispatch(const int* rank_prefix_matrix, int num_me
 
 void cached_notify_dispatch(const int* rank_prefix_matrix, int num_memset_int, void** buffer_ptrs, int** task_fifo_ptrs,
                             int head, int rank, int num_ranks, cudaStream_t stream) {
-#define CACHED_NOTIFY_DISPATCH_LAUNCH_CASE(ranks)                                                                     \
-  LAUNCH_KERNEL(&cfg, cached_notify_dispatch<ranks>, rank_prefix_matrix, num_memset_int, buffer_ptrs, task_fifo_ptrs, \
-                head, rank);                                                                                          \
-  break
-
-  SETUP_LAUNCH_CONFIG(1, 128, stream);
-  SWITCH_RANKS(CACHED_NOTIFY_DISPATCH_LAUNCH_CASE);
-#undef CACHED_NOTIFY_DISPATCH_LAUNCH_CASE
+  allowed_nvl_ranks::lift(num_ranks, [&](auto N) {
+    constexpr int kNumRanks = N;
+    launch_kernel(1, 128, stream, cached_notify_dispatch<kNumRanks>, rank_prefix_matrix, num_memset_int, buffer_ptrs,
+                  task_fifo_ptrs, head, rank);
+  });
 }
 
 template <int kNumRanks, int kNumThreads>
@@ -447,20 +441,17 @@ void dispatch(void* recv_x, float* recv_x_scales, int* recv_src_idx, int64_t* re
               const float* topk_weights, const bool* is_token_in_rank, const int* channel_prefix_matrix, int num_tokens,
               int hidden_int4, int num_topk, int num_experts, int num_scales, void** buffer_ptrs, int rank,
               int num_ranks, cudaStream_t stream, int num_sms, int num_max_send_tokens, int num_recv_buffer_tokens) {
-  constexpr int kNumThreads = 512;
-
-#define DISPATCH_LAUNCH_CASE(ranks)                                                                                 \
-  LAUNCH_KERNEL(&cfg, dispatch<ranks, kNumThreads>, reinterpret_cast<int4*>(recv_x), recv_x_scales, recv_src_idx,   \
-                recv_topk_idx, recv_topk_weights, recv_channel_offset, send_head, reinterpret_cast<const int4*>(x), \
-                x_scales, topk_idx, topk_weights, is_token_in_rank, channel_prefix_matrix, num_tokens, hidden_int4, \
-                num_topk, num_experts, num_scales, buffer_ptrs, rank, num_max_send_tokens, num_recv_buffer_tokens); \
-  break
-
   // Even-numbered blocks for sending, odd-numbered blocks for receiving.
   EP_HOST_ASSERT(num_sms % 2 == 0);
-  SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
-  SWITCH_RANKS(DISPATCH_LAUNCH_CASE);
-#undef DISPATCH_LAUNCH_CASE
+  allowed_nvl_ranks::lift(num_ranks, [&](auto N) {
+    constexpr int kNumRanks = N;
+    constexpr int kNumThreads = 512;
+    launch_kernel(num_sms, kNumThreads, stream, dispatch<kNumRanks, kNumThreads>, reinterpret_cast<int4*>(recv_x), recv_x_scales,
+                  recv_src_idx, recv_topk_idx, recv_topk_weights, recv_channel_offset, send_head,
+                  reinterpret_cast<const int4*>(x), x_scales, topk_idx, topk_weights, is_token_in_rank,
+                  channel_prefix_matrix, num_tokens, hidden_int4, num_topk, num_experts, num_scales, buffer_ptrs,
+                  rank, num_max_send_tokens, num_recv_buffer_tokens);
+  });
 }
 
 template <int kNumRanks>
@@ -515,18 +506,15 @@ __global__ void cached_notify_combine(void** buffer_ptrs, int* send_head, int nu
 void cached_notify_combine(void** buffer_ptrs, int* send_head, int num_channels, int num_recv_tokens,
                            int num_memset_int, int** task_fifo_ptrs, int head, int rank, int num_ranks,
                            cudaStream_t stream) {
-#define CACHED_NOTIFY_COMBINE(ranks)                                                                       \
-  LAUNCH_KERNEL(&cfg, cached_notify_combine<ranks>, buffer_ptrs, send_head, num_channels, num_recv_tokens, \
-                num_memset_int, task_fifo_ptrs, head, rank);                                               \
-  break
-
-  const int num_threads = std::max(128, 32 * num_ranks);
-  EP_HOST_ASSERT(num_ranks <= num_threads);
-  EP_HOST_ASSERT(num_threads <= 1024);
   EP_HOST_ASSERT(1 + num_channels <= num_channels * 2);
-  SETUP_LAUNCH_CONFIG(1 + num_channels, num_threads, stream);
-  SWITCH_RANKS(CACHED_NOTIFY_COMBINE);
-#undef CACHED_NOTIFY_COMBINE
+  allowed_nvl_ranks::lift(num_ranks, [&](auto N) {
+    constexpr int kNumRanks = N;
+    constexpr int kNumThreads = std::max(128, 32 * kNumRanks);
+    static_assert(kNumRanks <= kNumThreads, "Number of ranks should be less than or equal to number of threads");
+    static_assert(kNumThreads <= 1024, "Number of threads should be less than or equal to 1024");
+    launch_kernel(1 + num_channels, kNumThreads, stream, cached_notify_combine<kNumRanks>, buffer_ptrs, send_head,
+                  num_channels, num_recv_tokens, num_memset_int, task_fifo_ptrs, head, rank);
+  });
 }
 
 template <typename dtype_t, int kNumRanks, int kNumThreads>
@@ -796,25 +784,21 @@ void combine(cudaDataType_t type, void* recv_x, float* recv_topk_weights, const 
              const int* src_idx, const int* rank_prefix_matrix, const int* channel_prefix_matrix, int* send_head,
              int num_tokens, int num_recv_tokens, int hidden, int num_topk, void** buffer_ptrs, int rank, int num_ranks,
              cudaStream_t stream, int num_sms, int num_max_send_tokens, int num_recv_buffer_tokens) {
-  constexpr int kNumThreads = 768;
-
-#define COMBINE_LAUNCH_CASE(dtype, ranks)                                                                            \
-  LAUNCH_KERNEL(&cfg, (combine<dtype, ranks, kNumThreads>), reinterpret_cast<dtype*>(recv_x), recv_topk_weights,     \
-                reinterpret_cast<const dtype*>(x), topk_weights, src_idx, rank_prefix_matrix, channel_prefix_matrix, \
-                send_head, num_tokens, num_recv_tokens, hidden, num_topk, buffer_ptrs, rank, num_max_send_tokens,    \
-                num_recv_buffer_tokens);                                                                             \
-  break
-#define COMBINE_DTYPE_LAUNCH_CASE(dtype)               \
-  SWITCH_RANKS_WITH_DTYPE(dtype, COMBINE_LAUNCH_CASE); \
-  break
-
   // Even-numbered blocks for sending, odd-numbered blocks for receiving
   EP_HOST_ASSERT(num_sms % 2 == 0);
-  EP_HOST_ASSERT(kNumThreads >= num_ranks * 32);
-  SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
-  SWITCH_TYPES(COMBINE_DTYPE_LAUNCH_CASE);
-#undef COMBINE_DTYPE_LAUNCH_CASE
-#undef COMBINE_LAUNCH_CASE
+  supported_dtypes::lift(type, [&](auto tag) {
+    using Dtype = typename decltype(tag)::type;
+    allowed_nvl_ranks::lift(num_ranks, [&](auto N) {
+      constexpr int kNumRanks = N;
+      constexpr int kNumThreads = 768;
+      static_assert(kNumThreads >= kNumRanks * 32, "Number of threads should be greater than or equal to number of ranks times 32");
+      auto kernel = combine<Dtype, kNumRanks, kNumThreads>;
+      launch_kernel(num_sms, kNumThreads, stream, kernel, reinterpret_cast<Dtype*>(recv_x), recv_topk_weights,
+                    reinterpret_cast<const Dtype*>(x), topk_weights, src_idx, rank_prefix_matrix,
+                    channel_prefix_matrix, send_head, num_tokens, num_recv_tokens, hidden, num_topk, buffer_ptrs,
+                    rank, num_max_send_tokens, num_recv_buffer_tokens);
+    });
+  });
 }
 
 }  // namespace intranode

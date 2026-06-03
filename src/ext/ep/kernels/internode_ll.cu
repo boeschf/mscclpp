@@ -128,12 +128,12 @@ void clean_low_latency_buffer(int64_t* clean_0, int num_clean_int_0, int64_t* cl
                               cudaStream_t stream) {
   constexpr int kNumThreads = 256;
 
-  SETUP_LAUNCH_CONFIG(1, kNumThreads, stream);
+  auto cfg = make_cooperative_launch_config(1, kNumThreads, stream);
   if (use_ipc_path) {
-    LAUNCH_KERNEL(&cfg, (clean_low_latency_buffer<kNumThreads, true>), clean_0, num_clean_int_0, clean_1,
+    launch_kernel(cfg, clean_low_latency_buffer<kNumThreads, true>, clean_0, num_clean_int_0, clean_1,
                   num_clean_int_1, port_channel_handles, memory_channel_handles, rank, num_ranks);
   } else {
-    LAUNCH_KERNEL(&cfg, (clean_low_latency_buffer<kNumThreads, false>), clean_0, num_clean_int_0, clean_1,
+    launch_kernel(cfg, clean_low_latency_buffer<kNumThreads, false>, clean_0, num_clean_int_0, clean_1,
                   num_clean_int_1, port_channel_handles, memory_channel_handles, rank, num_ranks);
   }
 }
@@ -463,39 +463,21 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales, int* packed_recv
   auto atomic_finish_counter_per_expert = atomic_counter_per_expert + num_experts;
   EP_HOST_ASSERT(num_experts * sizeof(int) * 2 <= NUM_WORKSPACE_BYTES);
 
-#define DISPATCH_LAUNCH_CASE(hidden_case)                                                                            \
-  {                                                                                                                  \
-    if (use_ipc_path && !ipc_wide) {                                                                                 \
-      auto dispatch_func = use_fp8 ? dispatch<true, true, kNumWarpGroupsIpc, kNumWarpsPerGroupIpc, hidden_case>      \
-                                   : dispatch<false, true, kNumWarpGroupsIpc, kNumWarpsPerGroupIpc, hidden_case>;    \
-      LAUNCH_KERNEL(&cfg, dispatch_func, packed_recv_x, packed_recv_x_scales, packed_recv_src_info,                  \
-                    packed_recv_layout_range, packed_recv_count, rdma_recv_x, rdma_recv_count, rdma_x, x, topk_idx,  \
-                    atomic_counter_per_expert, atomic_finish_counter_per_expert, next_clean, num_next_clean_int,     \
-                    num_tokens, num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank, num_ranks, phases,    \
-                    rdma_buffer_ptr, port_channel_handles, peer_rdma_bases, memory_channel_handles);                 \
-    } else if (use_ipc_path && ipc_wide) {                                                                           \
-      auto dispatch_func = use_fp8 ? dispatch<true, true, kNumWarpGroupsRdma, kNumWarpsPerGroupRdma, hidden_case>    \
-                                   : dispatch<false, true, kNumWarpGroupsRdma, kNumWarpsPerGroupRdma, hidden_case>;  \
-      LAUNCH_KERNEL(&cfg, dispatch_func, packed_recv_x, packed_recv_x_scales, packed_recv_src_info,                  \
-                    packed_recv_layout_range, packed_recv_count, rdma_recv_x, rdma_recv_count, rdma_x, x, topk_idx,  \
-                    atomic_counter_per_expert, atomic_finish_counter_per_expert, next_clean, num_next_clean_int,     \
-                    num_tokens, num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank, num_ranks, phases,    \
-                    rdma_buffer_ptr, port_channel_handles, peer_rdma_bases, memory_channel_handles);                 \
-    } else {                                                                                                         \
-      auto dispatch_func = use_fp8 ? dispatch<true, false, kNumWarpGroupsRdma, kNumWarpsPerGroupRdma, hidden_case>   \
-                                   : dispatch<false, false, kNumWarpGroupsRdma, kNumWarpsPerGroupRdma, hidden_case>; \
-      LAUNCH_KERNEL(&cfg, dispatch_func, packed_recv_x, packed_recv_x_scales, packed_recv_src_info,                  \
-                    packed_recv_layout_range, packed_recv_count, rdma_recv_x, rdma_recv_count, rdma_x, x, topk_idx,  \
-                    atomic_counter_per_expert, atomic_finish_counter_per_expert, next_clean, num_next_clean_int,     \
-                    num_tokens, num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank, num_ranks, phases,    \
-                    rdma_buffer_ptr, port_channel_handles, peer_rdma_bases, memory_channel_handles);                 \
-    }                                                                                                                \
-  }                                                                                                                  \
-  break
-
-  SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
-  SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
-#undef DISPATCH_LAUNCH_CASE
+  allowed_hidden_sizes::lift(hidden, [&](auto S) {
+    constexpr int kHiddenCase = S;
+    auto dispatch_func =
+      use_ipc_path ? (ipc_wide ? (use_fp8 ? dispatch<true, true, kNumWarpGroupsRdma, kNumWarpsPerGroupRdma, kHiddenCase>
+                                          : dispatch<false, true, kNumWarpGroupsRdma, kNumWarpsPerGroupRdma, kHiddenCase>)
+                               : (use_fp8 ? dispatch<true, true, kNumWarpGroupsIpc, kNumWarpsPerGroupIpc, kHiddenCase>
+                                          : dispatch<false, true, kNumWarpGroupsIpc, kNumWarpsPerGroupIpc, kHiddenCase>))
+                   : (use_fp8 ? dispatch<true, false, kNumWarpGroupsRdma, kNumWarpsPerGroupRdma, kHiddenCase>
+                              : dispatch<false, false, kNumWarpGroupsRdma, kNumWarpsPerGroupRdma, kHiddenCase>);
+    launch_kernel(num_sms, num_warps * 32, stream, dispatch_func, packed_recv_x, packed_recv_x_scales, packed_recv_src_info,
+                  packed_recv_layout_range, packed_recv_count, rdma_recv_x, rdma_recv_count, rdma_x, x, topk_idx,
+                  atomic_counter_per_expert, atomic_finish_counter_per_expert, next_clean, num_next_clean_int,
+                  num_tokens, num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank, num_ranks, phases,
+                  rdma_buffer_ptr, port_channel_handles, peer_rdma_bases, memory_channel_handles);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -712,36 +694,18 @@ void combine(void* combined_x, void* rdma_recv_x, int64_t* rdma_recv_flag, void*
   EP_HOST_ASSERT(sizeof(int) <= NUM_WORKSPACE_BYTES);
   EP_HOST_ASSERT(num_topk <= kNumMaxTopk);
 
-#define COMBINE_LAUNCH_CASE(hidden_case)                                                                        \
-  {                                                                                                             \
-    if (use_ipc_path && !ipc_wide) {                                                                            \
-      auto combine_func = combine<true, kNumWarpGroupsIpc, kNumWarpsPerGroupIpc, hidden_case, kNumMaxTopk>;     \
-      LAUNCH_KERNEL(&cfg, combine_func, combined_x, rdma_recv_x, rdma_recv_flag, rdma_send_x, x, topk_idx,      \
-                    topk_weights, src_info, layout_range, next_clean, num_next_clean_int, atomic_clean_flag,    \
-                    num_combined_tokens, hidden, num_topk, num_max_dispatch_tokens_per_rank, num_experts, rank, \
-                    num_ranks, phases, zero_copy, rdma_buffer_ptr, port_channel_handles, peer_rdma_bases,       \
-                    memory_channel_handles);                                                                    \
-    } else if (use_ipc_path && ipc_wide) {                                                                      \
-      auto combine_func = combine<true, kNumWarpGroupsRdma, kNumWarpsPerGroupRdma, hidden_case, kNumMaxTopk>;   \
-      LAUNCH_KERNEL(&cfg, combine_func, combined_x, rdma_recv_x, rdma_recv_flag, rdma_send_x, x, topk_idx,      \
-                    topk_weights, src_info, layout_range, next_clean, num_next_clean_int, atomic_clean_flag,    \
-                    num_combined_tokens, hidden, num_topk, num_max_dispatch_tokens_per_rank, num_experts, rank, \
-                    num_ranks, phases, zero_copy, rdma_buffer_ptr, port_channel_handles, peer_rdma_bases,       \
-                    memory_channel_handles);                                                                    \
-    } else {                                                                                                    \
-      auto combine_func = combine<false, kNumWarpGroupsRdma, kNumWarpsPerGroupRdma, hidden_case, kNumMaxTopk>;  \
-      LAUNCH_KERNEL(&cfg, combine_func, combined_x, rdma_recv_x, rdma_recv_flag, rdma_send_x, x, topk_idx,      \
-                    topk_weights, src_info, layout_range, next_clean, num_next_clean_int, atomic_clean_flag,    \
-                    num_combined_tokens, hidden, num_topk, num_max_dispatch_tokens_per_rank, num_experts, rank, \
-                    num_ranks, phases, zero_copy, rdma_buffer_ptr, port_channel_handles, peer_rdma_bases,       \
-                    memory_channel_handles);                                                                    \
-    }                                                                                                           \
-  }                                                                                                             \
-  break
-
-  SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
-  SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
-#undef COMBINE_LAUNCH_CASE
+  allowed_hidden_sizes::lift(hidden, [&](auto S) {
+    constexpr int kHiddenCase = S;
+    auto combine_func = 
+      use_ipc_path ? (ipc_wide ? combine<true, kNumWarpGroupsRdma, kNumWarpsPerGroupRdma, kHiddenCase, kNumMaxTopk>
+                               : combine<true, kNumWarpGroupsIpc, kNumWarpsPerGroupIpc, kHiddenCase, kNumMaxTopk>)
+                   : combine<false, kNumWarpGroupsRdma, kNumWarpsPerGroupRdma, kHiddenCase, kNumMaxTopk>;
+    launch_kernel(num_sms, num_warps * 32, stream, combine_func, combined_x, rdma_recv_x, rdma_recv_flag, rdma_send_x, x, topk_idx,
+                  topk_weights, src_info, layout_range, next_clean, num_next_clean_int, atomic_clean_flag,
+                  num_combined_tokens, kHiddenCase, num_topk, num_max_dispatch_tokens_per_rank, num_experts, rank,
+                  num_ranks, phases, zero_copy, rdma_buffer_ptr, port_channel_handles, peer_rdma_bases,
+                  memory_channel_handles);
+  });
 }
 
 }  // namespace internode_ll
