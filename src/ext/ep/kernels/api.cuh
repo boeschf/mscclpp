@@ -65,7 +65,7 @@ int get_source_meta_bytes();
 
 void get_dispatch_layout(const int64_t* topk_idx, int* num_tokens_per_rank, int* num_tokens_per_rdma_rank,
                          int* num_tokens_per_expert, bool* is_token_in_rank, int num_tokens, int num_topk,
-                         int num_ranks, int num_experts, cudaStream_t stream);
+                         int num_ranks, int num_local_ranks, int num_experts, cudaStream_t stream);
 
 void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, int num_ranks,
                      const int* num_tokens_per_rdma_rank, int* moe_recv_rdma_counter_mapped,
@@ -74,7 +74,8 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
                      int num_topk, int expert_alignment, int* rdma_channel_prefix_matrix,
                      int* recv_rdma_rank_prefix_sum, int* gbl_channel_prefix_matrix, int* recv_gbl_rank_prefix_sum,
                      void* rdma_buffer_ptr, int num_max_rdma_chunked_recv_tokens, void** buffer_ptrs,
-                     int num_max_nvl_chunked_recv_tokens, int** task_fifo_ptrs, int head, int rank, cudaStream_t stream,
+                     int num_max_nvl_chunked_recv_tokens, int** task_fifo_ptrs, int head, int rank,
+                     int num_local_ranks, cudaStream_t stream,
                      int64_t num_rdma_bytes, int64_t num_nvl_bytes, bool low_latency_mode,
                      mscclpp::PortChannelDeviceHandle* port_channel_handles,
                      mscclpp::MemoryChannelDeviceHandle* memory_channel_handles);
@@ -88,6 +89,7 @@ void dispatch(void* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float*
               int num_experts, const bool* is_token_in_rank, void* rdma_buffer_ptr,
               int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens, void** buffer_ptrs,
               int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens, int rank, int num_ranks,
+              int num_local_ranks,
               bool is_cached_dispatch, cudaStream_t stream, int num_channels, bool low_latency_mode,
               mscclpp::PortChannelDeviceHandle* port_channel_handles,
               mscclpp::MemoryChannelDeviceHandle* memory_channel_handles);
@@ -96,7 +98,8 @@ void cached_notify(int hidden_int4, int num_scales, int num_topk_idx, int num_to
                    int num_channels, int num_combined_tokens, int* combined_rdma_head,
                    const int* rdma_channel_prefix_matrix, const int* rdma_rank_prefix_sum, int* combined_nvl_head,
                    void* rdma_buffer_ptr, int num_max_rdma_chunked_recv_tokens, void** buffer_ptrs,
-                   int num_max_nvl_chunked_recv_tokens, int** task_fifo_ptrs, int head, int rank, cudaStream_t stream,
+                   int num_max_nvl_chunked_recv_tokens, int** task_fifo_ptrs, int head, int rank,
+                   int num_local_ranks, cudaStream_t stream,
                    int64_t num_rdma_bytes, int64_t num_nvl_bytes, bool is_cached_dispatch, bool low_latency_mode,
                    mscclpp::PortChannelDeviceHandle* port_channel_handles,
                    mscclpp::MemoryChannelDeviceHandle* memory_channel_handles);
@@ -107,7 +110,7 @@ void combine(cudaDataType_t type, void* combined_x, float* combined_topk_weights
              const int* gbl_channel_prefix_matrix, int num_tokens, int num_combined_tokens, int hidden, int num_topk,
              void* rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
              void** buffer_ptrs, int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens, int rank,
-             int num_ranks, cudaStream_t stream, int num_channels, bool low_latency_mode,
+             int num_ranks, int num_local_ranks, cudaStream_t stream, int num_channels, bool low_latency_mode,
              mscclpp::PortChannelDeviceHandle* port_channel_handles,
              mscclpp::MemoryChannelDeviceHandle* memory_channel_handles);
 

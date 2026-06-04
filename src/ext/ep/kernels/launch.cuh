@@ -21,6 +21,8 @@
 #define SWITCH_RANKS(case_macro)                       \
   do {                                                 \
     switch (num_ranks) {                               \
+      case 1:                                          \
+        case_macro(1);                                 \
       case 2:                                          \
         case_macro(2);                                 \
       case 4:                                          \
@@ -34,7 +36,9 @@
 
 #define SWITCH_RDMA_RANKS(case_macro)                       \
   do {                                                      \
-    switch (num_ranks / NUM_MAX_NVL_PEERS) {                \
+    switch (num_rdma_ranks) {                               \
+      case 1:                                               \
+        case_macro(1);                                      \
       case 2:                                               \
         case_macro(2);                                      \
       case 3:                                               \
@@ -57,6 +61,8 @@
 #define SWITCH_RANKS_WITH_DTYPE(dtype, case_macro)    \
   do {                                                \
     switch (num_ranks) {                              \
+      case 1:                                         \
+        case_macro(dtype, 1);                         \
       case 2:                                         \
         case_macro(dtype, 2);                         \
       case 4:                                         \

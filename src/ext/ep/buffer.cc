@@ -112,7 +112,7 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
   rdma_rank = rank / this->num_local_ranks;
   nvl_rank = rank % this->num_local_ranks;
   num_rdma_ranks = std::max(1, num_ranks / this->num_local_ranks);
-  num_nvl_ranks = std::min(num_ranks, this->num_local_ranks);
+  num_nvl_ranks = (num_ranks > this->num_local_ranks) ? NUM_MAX_NVL_PEERS : std::min(num_ranks, this->num_local_ranks);
 
   // Get device info
   cudaDeviceProp device_prop = {};
@@ -268,17 +268,25 @@ void Buffer::sync(const std::vector<int>& device_ids,
   if (num_nvl_bytes > 0) {
     EP_HOST_ASSERT(num_ranks == device_ids.size());
     EP_HOST_ASSERT(device_ids.size() == all_gathered_handles.size());
-    for (int i = 0, offset = rdma_rank * num_nvl_ranks; i < num_nvl_ranks; ++i) {
-      EP_HOST_ASSERT(all_gathered_handles[offset + i].has_value());
-      auto handle_str = std::string(all_gathered_handles[offset + i].value());
+    const int local_group_offset = rdma_rank * num_local_ranks;
+    const int local_group_size = std::min(num_local_ranks, num_ranks - local_group_offset);
+    for (int i = 0; i < local_group_size; ++i) {
+      const int global_rank = local_group_offset + i;
+      EP_HOST_ASSERT(all_gathered_handles[global_rank].has_value());
+      auto handle_str = std::string(all_gathered_handles[global_rank].value());
       EP_HOST_ASSERT(handle_str.size() == CUDA_IPC_HANDLE_SIZE);
-      if (offset + i != rank) {
+      if (global_rank != rank) {
         std::memcpy(ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE);
         CUDA_CHECK(cudaIpcOpenMemHandle(&buffer_ptrs[i], ipc_handles[i], cudaIpcMemLazyEnablePeerAccess));
         task_fifo_ptrs[i] = reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(buffer_ptrs[i]) + num_nvl_bytes);
       } else {
         EP_HOST_ASSERT(std::memcmp(ipc_handles[i].reserved, handle_str.c_str(), CUDA_IPC_HANDLE_SIZE) == 0);
       }
+    }
+
+    for (int i = local_group_size; i < NUM_MAX_NVL_PEERS; ++i) {
+      buffer_ptrs[i] = buffer_ptrs[nvl_rank];
+      task_fifo_ptrs[i] = task_fifo_ptrs[nvl_rank];
     }
 
     // Copy all buffer and task pointers to GPU
@@ -292,8 +300,8 @@ void Buffer::sync(const std::vector<int>& device_ids,
     {
       std::vector<std::shared_future<mscclpp::Connection>> connection_futures;
       mscclpp::EndpointConfig local_config(ipc_transport);
-      for (int i = 0; i < num_nvl_ranks; ++i) {
-        auto r = i + rdma_rank * num_nvl_ranks;
+      for (int i = 0; i < local_group_size; ++i) {
+        auto r = i + local_group_offset;
         connection_futures.emplace_back(communicator->connect(local_config, r, 0));
       }
       for (auto& future : connection_futures) {
@@ -303,20 +311,20 @@ void Buffer::sync(const std::vector<int>& device_ids,
 
     auto buffer_mem = communicator->registerMemory(buffer_ptrs[nvl_rank], num_nvl_bytes, ipc_transport);
 
-    std::vector<std::shared_future<mscclpp::RegisteredMemory>> remote_mem_futures(num_nvl_ranks);
-    for (int i = 0; i < num_nvl_ranks; ++i) {
+    std::vector<std::shared_future<mscclpp::RegisteredMemory>> remote_mem_futures(local_group_size);
+    for (int i = 0; i < local_group_size; ++i) {
       if (i == nvl_rank) continue;
-      auto r = i + rdma_rank * num_nvl_ranks;
+      auto r = i + local_group_offset;
       communicator->sendMemory(buffer_mem, r, 0);
       remote_mem_futures[i] = communicator->recvMemory(r, 0);
     }
-    for (int i = 0; i < num_nvl_ranks; ++i) {
+    for (int i = 0; i < local_group_size; ++i) {
       if (i == nvl_rank) continue;
       auto sema = std::make_shared<mscclpp::MemoryDevice2DeviceSemaphore>(*communicator, connections[i]);
       memory_channels.emplace_back(sema, remote_mem_futures[i].get(), buffer_mem);
     }
     std::vector<mscclpp::MemoryChannelDeviceHandle> memory_channel_handles(num_nvl_ranks);
-    for (int i = 0; i < num_nvl_ranks; ++i) {
+    for (int i = 0; i < local_group_size; ++i) {
       if (i == nvl_rank) continue;
       memory_channel_handles[i] = memory_channels.rbegin()->deviceHandle();
     }
@@ -346,125 +354,195 @@ void Buffer::sync(const std::vector<int>& device_ids,
 
     const bool ll_ipc_only = low_latency_mode && num_rdma_ranks == 1;
 
-    // Rank -> RDMA buffer IDs. MemoryIds are local to each ProxyService;
-    // we register every memory in every proxy in the same global order so
-    // a single int identifies the memory across all of them.
     if (!ll_ipc_only) {
-      std::map<int, mscclpp::MemoryId> memory_ids;
+      enum class EpRdmaTransport { IB, OFI };
 
-      auto add_memory_to_all = [&](mscclpp::RegisteredMemory mem) -> mscclpp::MemoryId {
-        mscclpp::MemoryId id = static_cast<mscclpp::MemoryId>(-1);
-        for (auto& ps : proxy_services) {
-          auto cur = ps->addMemory(mem);
-          if (id == static_cast<mscclpp::MemoryId>(-1)) id = cur;
-          EP_HOST_ASSERT(cur == id && "MemoryIds drifted across proxy services");
+      auto resolveRdmaTransport = [&]() -> EpRdmaTransport {
+        const char* envTransport = std::getenv("MSCCLPP_EP_RDMA_TRANSPORT");
+        if (envTransport == nullptr) {
+          return EpRdmaTransport::OFI;
         }
-        return id;
+        std::string value(envTransport);
+        for (char& c : value) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (value == "IB") return EpRdmaTransport::IB;
+        if (value == "OFI") return EpRdmaTransport::OFI;
+        if (value == "AUTO") return EpRdmaTransport::OFI;
+        throw std::runtime_error("invalid MSCCLPP_EP_RDMA_TRANSPORT; expected IB, OFI, or AUTO");
       };
 
-      // Register local memory
-      auto local_rdma_buffer_mem = communicator->registerMemory(rdma_buffer_ptr, num_rdma_bytes, all_transport);
-      memory_ids[rank] = add_memory_to_all(local_rdma_buffer_mem);
+      const EpRdmaTransport rdmaTransport = resolveRdmaTransport();
+      const bool useOfiRdma = (rdmaTransport == EpRdmaTransport::OFI);
+      const int activeProxyServices = useOfiRdma ? 1 : num_proxy_services;
 
-    // Send local memory to other ranks.
-    //
-    // NOTE: DeepEP filters this to same-GPU-ID peers in low_latency_mode
-    // because LL there uses NVSHMEM, not port channels. This port drives
-    // LL kernels through PortChannel, so every peer must have a real
-    // memory/connection/semaphore/port channel entry. Treat LL and HT
-    // sync identically: always connect all peers.
-    //
-    // Caveat: for a pure intra-node LL launch (``num_nvl_bytes == 0`` with
-    // every peer on the same host) the resulting port channels go through
-    // the CPU proxy over IB loopback between different HCAs, which on
-    // this platform does not deliver atomics reliably and currently
-    // deadlocks LL dispatch. See `src/ext/ep/README.md` for the full
-    // discussion. Cross-node LL (DeepEP's recommended 1-GPU-per-node
-    // topology) is unaffected.
-    // Use tag=1 to disambiguate from the NVL phase's tag=0 traffic with same-node peers.
       constexpr int kRdmaTag = 1;
-      for (int r = 0; r < num_ranks; ++r) {
-        if (r == rank) continue;
-        communicator->sendMemory(local_rdma_buffer_mem, r, kRdmaTag);
-      }
+      constexpr int kOfiMemTagBase = 100;
 
-      // Receive remote memory from other ranks.
-      for (int r = 0; r < num_ranks; ++r) {
-        if (r == rank) continue;
-        auto f = communicator->recvMemory(r, kRdmaTag);
-        auto mem = f.get();
-        memory_ids[r] = add_memory_to_all(std::move(mem));
-      }
-
-      // Rank -> vector of connections
       std::unordered_map<int, std::vector<mscclpp::Connection>> connections;
       const mscclpp::EndpointConfig ipc_cfg(ipc_transport);
-      const mscclpp::EndpointConfig ib_cfg(ib_transport);
 
-      // Self connection for local memory (CUDA IPC).
-      connections[rank].emplace_back(communicator->connect(ipc_cfg, rank, kRdmaTag).get());
+      std::vector<int> proxyIndices;
+      proxyIndices.reserve(activeProxyServices);
+      for (int p = 0; p < activeProxyServices; ++p) proxyIndices.push_back(p);
 
-      // Remote IB connections (multi-QP per peer).
-      const int num_ib_connections_per_rank = 12;  // #QPs per rank (mirrors DeepEP).
-      for (int r = 0; r < num_ranks; ++r) {
-        if (r == rank) continue;
-        std::vector<std::shared_future<mscclpp::Connection>> futures;
-        futures.reserve(num_ib_connections_per_rank);
-        for (int i = 0; i < num_ib_connections_per_rank; ++i) {
-          futures.emplace_back(communicator->connect(ib_cfg, r, kRdmaTag));
-        }
-        for (auto& f : futures) connections[r].emplace_back(f.get());
-      }
-
-    // Rank -> vector of (proxy_idx, semaphore_id_within_proxy). Iterate
-    // peers in sorted rank order so semaphore pairings between nodes line
-    // up deterministically. Channels — and therefore their backing
-    // semaphores — are sharded across `proxy_services`: channel at flat
-    // index `i*num_ranks + r` lives on proxy `(i*num_ranks + r) %
-    // num_proxy_services`. SemaphoreIds are local to each proxy, so we
-    // record (proxy_idx, sid) pairs.
-      std::unordered_map<int, std::vector<std::pair<int, mscclpp::SemaphoreId>>> sema_ids;
-      const int num_semaphores_per_rank = 16;
-      for (int i = 0; i < num_semaphores_per_rank; ++i) {
+      if (useOfiRdma) {
+        const mscclpp::EndpointConfig ofi_cfg{mscclpp::Transport::Ofi, {mscclpp::DeviceType::GPU, device_id}};
         for (int r = 0; r < num_ranks; ++r) {
-          auto conn_it = connections.find(r);
-          EP_HOST_ASSERT(conn_it != connections.end());
-          auto& conns = conn_it->second;
-          auto& conn = conns[i % conns.size()];
-          int proxy_idx = (i * num_ranks + r) % num_proxy_services;
-          auto sema_id = proxy_services[proxy_idx]->buildAndAddSemaphore(*communicator, conn);
-          sema_ids[r].emplace_back(proxy_idx, sema_id);
+          connections[r].resize(activeProxyServices);
         }
-      }
-
-    // Create port channels + device handles.
-    //
-    // The kernels index `port_channel_handles[channel_id * num_ranks + peer_rank]`
-    // where peer_rank is a GLOBAL rank in [0..num_ranks). So the outer stride must
-    // be num_ranks with peers in ascending rank order. Iterating `memory_ids` (an
-    // `unordered_map`) yields hash order and would misroute signals, deadlocking.
-    // Each channel inherits the proxy of the semaphore it was built on, so the
-    // resulting `PortChannelDeviceHandle` routes its FIFO pushes to the correct
-    // proxy thread.
-      const int num_port_channels_per_rank = num_semaphores_per_rank;
-      std::vector<mscclpp::PortChannelDeviceHandle> port_channel_handles;
-      for (int i = 0; i < num_port_channels_per_rank; ++i) {
+        for (int p : proxyIndices) {
+          connections[rank][p] = communicator->connect(ipc_cfg, rank, kRdmaTag + p).get();
+        }
         for (int r = 0; r < num_ranks; ++r) {
-          auto mem_it = memory_ids.find(r);
-          EP_HOST_ASSERT(mem_it != memory_ids.end());
-          auto memory_id = mem_it->second;
-          auto [proxy_idx, sema_id] = sema_ids[r][i % sema_ids[r].size()];
-          auto port_channel = proxy_services[proxy_idx]->portChannel(sema_id, memory_id, memory_ids[rank]);
-          port_channels.emplace_back(std::move(port_channel));
-          port_channel_handles.emplace_back(port_channels.rbegin()->deviceHandle());
+          if (r == rank) continue;
+          for (int p : proxyIndices) {
+            connections[r][p] = communicator->connect(ofi_cfg, r, kRdmaTag + p).get();
+          }
         }
-      }
 
-      port_channel_handles_device_ptr =
-          mscclpp::detail::gpuCallocShared<mscclpp::PortChannelDeviceHandle>(port_channel_handles.size());
-      mscclpp::gpuMemcpy<mscclpp::PortChannelDeviceHandle>(port_channel_handles_device_ptr.get(),
-                                                           port_channel_handles.data(), port_channel_handles.size(),
-                                                           cudaMemcpyHostToDevice);
+        std::vector<std::vector<mscclpp::RegisteredMemory>> localMemByRankProxy(
+            num_ranks, std::vector<mscclpp::RegisteredMemory>(activeProxyServices));
+        std::vector<std::vector<mscclpp::RegisteredMemory>> remoteMemByRankProxy(
+            num_ranks, std::vector<mscclpp::RegisteredMemory>(activeProxyServices));
+        std::vector<std::vector<std::shared_future<mscclpp::RegisteredMemory>>> remoteMemFutures(
+            num_ranks, std::vector<std::shared_future<mscclpp::RegisteredMemory>>(activeProxyServices));
+
+        for (int r = 0; r < num_ranks; ++r) {
+          if (r == rank) {
+            for (int p : proxyIndices) {
+              localMemByRankProxy[r][p] = communicator->registerMemory(rdma_buffer_ptr, num_rdma_bytes, ipc_transport);
+              remoteMemByRankProxy[r][p] = localMemByRankProxy[r][p];
+            }
+            continue;
+          }
+          for (int p : proxyIndices) {
+            auto& conn = connections[r][p];
+            localMemByRankProxy[r][p] =
+                communicator->registerMemory(rdma_buffer_ptr, num_rdma_bytes, mscclpp::Transport::Ofi, conn);
+            communicator->sendMemory2(localMemByRankProxy[r][p], kOfiMemTagBase + p);
+            remoteMemFutures[r][p] = communicator->recvMemory2(conn, kOfiMemTagBase + p);
+          }
+        }
+        for (int r = 0; r < num_ranks; ++r) {
+          if (r == rank) continue;
+          for (int p : proxyIndices) {
+            remoteMemByRankProxy[r][p] = remoteMemFutures[r][p].get();
+          }
+        }
+
+        std::vector<std::vector<mscclpp::MemoryId>> srcMemoryIdByRankProxy(
+            num_ranks, std::vector<mscclpp::MemoryId>(activeProxyServices));
+        std::vector<std::vector<mscclpp::MemoryId>> dstMemoryIdByRankProxy(
+            num_ranks, std::vector<mscclpp::MemoryId>(activeProxyServices));
+        for (int r = 0; r < num_ranks; ++r) {
+          for (int p : proxyIndices) {
+            srcMemoryIdByRankProxy[r][p] = proxy_services[p]->addMemory(localMemByRankProxy[r][p]);
+            dstMemoryIdByRankProxy[r][p] = proxy_services[p]->addMemory(remoteMemByRankProxy[r][p]);
+          }
+        }
+
+        std::unordered_map<int, std::vector<std::pair<int, mscclpp::SemaphoreId>>> sema_ids;
+        const int num_semaphores_per_rank = 16;
+        for (int i = 0; i < num_semaphores_per_rank; ++i) {
+          for (int r = 0; r < num_ranks; ++r) {
+            int proxy_idx = (i * num_ranks + r) % activeProxyServices;
+            auto& conn = connections[r][proxy_idx];
+            auto sema_id = proxy_services[proxy_idx]->buildAndAddSemaphore(*communicator, conn);
+            sema_ids[r].emplace_back(proxy_idx, sema_id);
+          }
+        }
+
+        const int num_port_channels_per_rank = num_semaphores_per_rank;
+        std::vector<mscclpp::PortChannelDeviceHandle> port_channel_handles;
+        for (int i = 0; i < num_port_channels_per_rank; ++i) {
+          for (int r = 0; r < num_ranks; ++r) {
+            auto [proxy_idx, sema_id] = sema_ids[r][i % sema_ids[r].size()];
+            auto port_channel = proxy_services[proxy_idx]->portChannel(
+                sema_id, dstMemoryIdByRankProxy[r][proxy_idx], srcMemoryIdByRankProxy[r][proxy_idx]);
+            port_channels.emplace_back(std::move(port_channel));
+            port_channel_handles.emplace_back(port_channels.rbegin()->deviceHandle());
+          }
+        }
+
+        port_channel_handles_device_ptr =
+            mscclpp::detail::gpuCallocShared<mscclpp::PortChannelDeviceHandle>(port_channel_handles.size());
+        mscclpp::gpuMemcpy<mscclpp::PortChannelDeviceHandle>(port_channel_handles_device_ptr.get(),
+                                                             port_channel_handles.data(), port_channel_handles.size(),
+                                                             cudaMemcpyHostToDevice);
+      } else {
+        std::map<int, mscclpp::MemoryId> memory_ids;
+
+        auto add_memory_to_all = [&](mscclpp::RegisteredMemory mem) -> mscclpp::MemoryId {
+          mscclpp::MemoryId id = static_cast<mscclpp::MemoryId>(-1);
+          for (auto& ps : proxy_services) {
+            auto cur = ps->addMemory(mem);
+            if (id == static_cast<mscclpp::MemoryId>(-1)) id = cur;
+            EP_HOST_ASSERT(cur == id && "MemoryIds drifted across proxy services");
+          }
+          return id;
+        };
+
+        auto local_rdma_buffer_mem = communicator->registerMemory(rdma_buffer_ptr, num_rdma_bytes, all_transport);
+        memory_ids[rank] = add_memory_to_all(local_rdma_buffer_mem);
+
+        for (int r = 0; r < num_ranks; ++r) {
+          if (r == rank) continue;
+          communicator->sendMemory(local_rdma_buffer_mem, r, kRdmaTag);
+        }
+
+        for (int r = 0; r < num_ranks; ++r) {
+          if (r == rank) continue;
+          auto f = communicator->recvMemory(r, kRdmaTag);
+          auto mem = f.get();
+          memory_ids[r] = add_memory_to_all(std::move(mem));
+        }
+
+        const mscclpp::EndpointConfig ib_cfg(ib_transport);
+        connections[rank].emplace_back(communicator->connect(ipc_cfg, rank, kRdmaTag).get());
+        const int num_ib_connections_per_rank = 12;
+        for (int r = 0; r < num_ranks; ++r) {
+          if (r == rank) continue;
+          std::vector<std::shared_future<mscclpp::Connection>> futures;
+          futures.reserve(num_ib_connections_per_rank);
+          for (int i = 0; i < num_ib_connections_per_rank; ++i) {
+            futures.emplace_back(communicator->connect(ib_cfg, r, kRdmaTag));
+          }
+          for (auto& f : futures) connections[r].emplace_back(f.get());
+        }
+
+        std::unordered_map<int, std::vector<std::pair<int, mscclpp::SemaphoreId>>> sema_ids;
+        const int num_semaphores_per_rank = 16;
+        for (int i = 0; i < num_semaphores_per_rank; ++i) {
+          for (int r = 0; r < num_ranks; ++r) {
+            auto conn_it = connections.find(r);
+            EP_HOST_ASSERT(conn_it != connections.end());
+            auto& conns = conn_it->second;
+            auto& conn = conns[i % conns.size()];
+            int proxy_idx = (i * num_ranks + r) % num_proxy_services;
+            auto sema_id = proxy_services[proxy_idx]->buildAndAddSemaphore(*communicator, conn);
+            sema_ids[r].emplace_back(proxy_idx, sema_id);
+          }
+        }
+
+        const int num_port_channels_per_rank = num_semaphores_per_rank;
+        std::vector<mscclpp::PortChannelDeviceHandle> port_channel_handles;
+        for (int i = 0; i < num_port_channels_per_rank; ++i) {
+          for (int r = 0; r < num_ranks; ++r) {
+            auto mem_it = memory_ids.find(r);
+            EP_HOST_ASSERT(mem_it != memory_ids.end());
+            auto memory_id = mem_it->second;
+            auto [proxy_idx, sema_id] = sema_ids[r][i % sema_ids[r].size()];
+            auto port_channel = proxy_services[proxy_idx]->portChannel(sema_id, memory_id, memory_ids[rank]);
+            port_channels.emplace_back(std::move(port_channel));
+            port_channel_handles.emplace_back(port_channels.rbegin()->deviceHandle());
+          }
+        }
+
+        port_channel_handles_device_ptr =
+            mscclpp::detail::gpuCallocShared<mscclpp::PortChannelDeviceHandle>(port_channel_handles.size());
+        mscclpp::gpuMemcpy<mscclpp::PortChannelDeviceHandle>(port_channel_handles_device_ptr.get(),
+                                                             port_channel_handles.data(), port_channel_handles.size(),
+                                                             cudaMemcpyHostToDevice);
+      }
     }
 
     // ------------------------------------------------------------------
@@ -578,7 +656,7 @@ Buffer::get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts, std:
       topk_idx.data_ptr<int64_t>(), num_tokens_per_rank.data_ptr<int>(),
       num_tokens_per_rdma_rank.has_value() ? num_tokens_per_rdma_rank.value().data_ptr<int>() : nullptr,
       num_tokens_per_expert.data_ptr<int>(), is_token_in_rank.data_ptr<bool>(), num_tokens, num_topk, num_ranks,
-      num_experts, comm_stream);
+      num_local_ranks, num_experts, comm_stream);
 
   // Wait streams
   std::optional<EventHandle> event;
@@ -1092,6 +1170,7 @@ Buffer::internode_dispatch(
     internode::cached_notify(hidden_int4, num_scales, num_topk, num_topk, num_ranks, num_channels, 0, nullptr, nullptr,
                              nullptr, nullptr, rdma_buffer_ptr, config.num_max_rdma_chunked_recv_tokens,
                              buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens, task_fifo_ptrs_gpu, head, rank,
+                             num_local_ranks,
                              comm_stream,
                              config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks, num_local_ranks),
                              num_nvl_bytes, true, low_latency_mode, port_channel_handles_device_ptr.get(),
@@ -1114,7 +1193,8 @@ Buffer::internode_dispatch(
         hidden_int4, num_scales, num_topk, expert_alignment, rdma_channel_prefix_matrix.data_ptr<int>(),
         recv_rdma_rank_prefix_sum.data_ptr<int>(), gbl_channel_prefix_matrix.data_ptr<int>(),
         recv_gbl_rank_prefix_sum.data_ptr<int>(), rdma_buffer_ptr, config.num_max_rdma_chunked_recv_tokens,
-        buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens, task_fifo_ptrs_gpu, head, rank, comm_stream,
+        buffer_ptrs_gpu, config.num_max_nvl_chunked_recv_tokens, task_fifo_ptrs_gpu, head, rank, num_local_ranks,
+        comm_stream,
         config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks, num_local_ranks), num_nvl_bytes,
         low_latency_mode,
         port_channel_handles_device_ptr.get(), memory_channel_handles_device_ptr.get());
@@ -1160,8 +1240,8 @@ Buffer::internode_dispatch(
         torch::empty({num_rdma_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
     recv_gbl_channel_prefix_matrix = torch::empty({num_ranks, num_channels}, dtype(torch::kInt32).device(torch::kCUDA));
     send_rdma_head = torch::empty({num_tokens, num_rdma_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
-    send_nvl_head =
-        torch::empty({num_rdma_recv_tokens, num_local_ranks}, dtype(torch::kInt32).device(torch::kCUDA));
+    const int nvl_head_width = is_internode_available() ? NUM_MAX_NVL_PEERS : num_local_ranks;
+    send_nvl_head = torch::empty({num_rdma_recv_tokens, nvl_head_width}, dtype(torch::kInt32).device(torch::kCUDA));
   }
 
   int64_t* recv_topk_idx_ptr = nullptr;
@@ -1191,7 +1271,7 @@ Buffer::internode_dispatch(
                       hidden_int4, num_scales, num_topk, num_experts, is_token_in_rank.data_ptr<bool>(),
                       rdma_buffer_ptr, config.num_max_rdma_chunked_send_tokens, config.num_max_rdma_chunked_recv_tokens,
                       buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens, config.num_max_nvl_chunked_recv_tokens,
-                      rank, num_ranks, cached_mode, comm_stream, num_channels, low_latency_mode,
+                      rank, num_ranks, num_local_ranks, cached_mode, comm_stream, num_channels, low_latency_mode,
                       port_channel_handles_device_ptr.get(), memory_channel_handles_device_ptr.get());
 
   // Wait streams
@@ -1271,7 +1351,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
   EP_HOST_ASSERT(gbl_channel_prefix_matrix.size(0) == num_ranks and gbl_channel_prefix_matrix.size(1) == num_channels);
   EP_HOST_ASSERT(combined_rdma_head.dim() == 2 and combined_rdma_head.size(0) == num_combined_tokens and
                  combined_rdma_head.size(1) == num_rdma_ranks);
-  EP_HOST_ASSERT(combined_nvl_head.dim() == 2 and combined_nvl_head.size(1) == num_local_ranks);
+  const int expected_nvl_head_width = is_internode_available() ? NUM_MAX_NVL_PEERS : num_local_ranks;
+  EP_HOST_ASSERT(combined_nvl_head.dim() == 2 and combined_nvl_head.size(1) == expected_nvl_head_width);
 
   auto compute_stream = at::cuda::getCurrentCUDAStream();
   if (allocate_on_comm_stream) {
@@ -1306,7 +1387,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
       hidden_int4, 0, 0, num_topk, num_ranks, num_channels, num_combined_tokens, combined_rdma_head.data_ptr<int>(),
       rdma_channel_prefix_matrix.data_ptr<int>(), rdma_rank_prefix_sum.data_ptr<int>(),
       combined_nvl_head.data_ptr<int>(), rdma_buffer_ptr, config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu,
-      config.num_max_nvl_chunked_recv_tokens, task_fifo_ptrs_gpu, head, rank, comm_stream,
+      config.num_max_nvl_chunked_recv_tokens, task_fifo_ptrs_gpu, head, rank, num_local_ranks, comm_stream,
       config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks, num_local_ranks), num_nvl_bytes, false,
       low_latency_mode,
       port_channel_handles_device_ptr.get(), memory_channel_handles_device_ptr.get());
@@ -1320,7 +1401,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                      rdma_rank_prefix_sum.data_ptr<int>(), gbl_channel_prefix_matrix.data_ptr<int>(), num_tokens,
                      num_combined_tokens, hidden, num_topk, rdma_buffer_ptr, config.num_max_rdma_chunked_send_tokens,
                      config.num_max_rdma_chunked_recv_tokens, buffer_ptrs_gpu, config.num_max_nvl_chunked_send_tokens,
-                     config.num_max_nvl_chunked_recv_tokens, rank, num_ranks, comm_stream, num_channels,
+                     config.num_max_nvl_chunked_recv_tokens, rank, num_ranks, num_local_ranks, comm_stream, num_channels,
                      low_latency_mode, port_channel_handles_device_ptr.get(), memory_channel_handles_device_ptr.get());
 
   std::optional<EventHandle> event;

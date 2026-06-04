@@ -161,7 +161,8 @@ def main():
 
     # Buffer config for internode HT: needs num_rdma_bytes > 0. Size buffers
     # using max(hidden, bench_hidden) so the optional bench phase fits.
-    cfg = ep.Config(20, 8, 256, 16, 128)
+    num_sms = int(os.environ.get("MSCCLPP_EP_TEST_NUM_SMS", "20"))
+    cfg = ep.Config(num_sms, 8, 256, 16, 128)
     _bench_on = os.environ.get("MSCCLPP_EP_BENCH", "0") == "1"
     _buf_hidden = (
         max(hidden, int(os.environ.get("MSCCLPP_EP_BENCH_HIDDEN", "0")))

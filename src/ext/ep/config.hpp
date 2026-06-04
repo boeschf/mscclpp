@@ -55,7 +55,7 @@ struct Config {
     EP_HOST_ASSERT(num_ranks < num_local_ranks || num_ranks % num_local_ranks == 0);
     EP_HOST_ASSERT(num_ranks <= num_local_ranks || num_sms % 2 == 0);
     const auto num_rdma_ranks = std::max(num_ranks / num_local_ranks, 1);
-    const auto num_nvl_ranks = std::min(num_ranks, num_local_ranks);
+    const auto num_nvl_ranks = (num_ranks > num_local_ranks) ? NUM_MAX_NVL_PEERS : std::min(num_ranks, num_local_ranks);
     const int num_channels = num_sms / 2;
 
     size_t num_bytes = 0;
